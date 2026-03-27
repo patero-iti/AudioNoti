@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Studio Projects Dashboard</title>
+    <!-- Allow unsafe-eval for Babel standalone -->
+    <meta http-equiv="Content-Security-Policy" content="script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://cdn.tailwindcss.com https://cdnjs.cloudflare.com; worker-src 'self' blob: https://cdnjs.cloudflare.com;">
+    
+    <!-- Dependencies -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- Custom Styles -->
+    <style>
+        body {
+            background-color: #0f172a; /* Slate 900 */
+            color: #e2e8f0; /* Slate 200 */
+        }
+        .studio-panel {
+            background-color: #1e293b; /* Slate 800 */
+            border: 1px solid #334155; /* Slate 700 */
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5);
+        }
+        .neon-text {
+            text-shadow: 0 0 10px rgba(34, 211, 238, 0.5);
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        const Dashboard = () => {
+            const [pdfHistory, setPdfHistory] = useState([]);
+            const [noteSessions, setNoteSessions] = useState([]);
+            const [searchQuery, setSearchQuery] = useState("");
+            const [sortOption, setSortOption] = useState("date");
+            const [editorProject, setEditorProject] = useState(null);
+            const [pdfHistoryPage, setPdfHistoryPage] = useState(1);
+            const [notesPage, setNotesPage] = useState(1);
+
+            useEffect(() => {
+                // 1. Load PDF History
+                // We only store metadata in localStorage because Blob URLs expire.
+                try {
+                    const savedPdf = localStorage.getItem('pdf_gen_history');
+                    if (savedPdf) {
+                        setPdfHistory(JSON.parse(savedPdf));
+                    }
+                } catch (e) {
+                    console.error("Error loading PDF history", e);
+                }
+
+                // 2. Load NoteTaker Sessions
+                // We scan localStorage keys for 'notes_' prefix
+                const sessions = [];
+                for (let i = 0; i < localStorage.length; i++) {
+                    const key = localStorage.key(i);
+                    if (key.startsWith('notes_')) {
+                        try {
+                            const fileName = key.replace('notes_', '');
+                            const notes = JSON.parse(localStorage.getItem(key));
+                            const noteCount = Array.isArray(notes) ? notes.length : 0;
+                            const lastTimestamp = Array.isArray(notes) && notes.length > 0 
+                                ? notes[notes.length - 1].timestamp 
+                                : 0;
+                            
+                            sessions.push({
+                                id: key,
+                                fileName,
+                                noteCount,
+                                lastTimestamp
+                            });
+                        } catch(e) {}
+                    }
+                }
+                setNoteSessions(sessions);
+
+                // 3. Load PDF Editor Project
+                try {
+                    const text = localStorage.getItem('studio_editor_text');
+                    const fileName = localStorage.getItem('studio_editor_filename');
+                    const lastModified = localStorage.getItem('studio_editor_last_modified');
+
+                    if (text && fileName) {
+                        setEditorProject({
+                            fileName,
+                            text,
+                            lastModified: lastModified ? new Date(lastModified).toLocaleString() : 'N/A'
+                        });
+                    }
+                } catch (e) {
+                    console.error("Error loading PDF Editor project", e);
+                }
+            }, []);
+
+            useEffect(() => {
+                // Reset page when filters change
+                setNotesPage(1);
+            }, [searchQuery, sortOption]);
+
+            const formatTime = (seconds) => {
+                if (!seconds) return "00:00";
+                const mins = Math.floor(seconds / 60);
+                const secs = Math.floor(seconds % 60);
+                return `${mins}:${secs.toString().padStart(2, '0')}`;
+            };
+
+            const exportSession = (session, format) => {
+                try {
+                    const notes = JSON.parse(localStorage.getItem(session.id) || '[]');
+                    if (!notes || notes.length === 0) {
+                        alert("No notes found for this session.");
+                        return;
+                    }
+
+                    const nameBase = session.fileName.replace(/\.[^/.]+$/, "") || "session";
+                    let content = "";
+                    let type = "";
+
+                    if (format === 'json') {
+                        content = JSON.stringify(notes, null, 2);
+                        type = "application/json";
+                    } else {
+                        const headers = "Timestamp,Formatted Time,Note\n";
+                        const rows = notes.map(n => {
+                            const escapedText = (n.text || "").replace(/"/g, '""');
+                            return `${n.timestamp},"${formatTime(n.timestamp)}","${escapedText}"`;
+                        }).join("\n");
+                        content = headers + rows;
+                        type = "text/csv";
+                    }
+
+                    const blob = new Blob([content], { type });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `${nameBase}.${format}`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                } catch (e) {
+                    console.error("Export failed", e);
+                    alert("Failed to export session.");
+                }
+            };
+
+            const handleLoadPdfHistory = (item) => {
+                const payload = { 
+                    type: 'LOAD_TEXT', 
+                    text: item.text, 
+                    fileName: `history_${item.id}.txt` 
+                };
+                
+                // Use sessionStorage for robust initial load when the tab is opened.
+                sessionStorage.setItem('studio_pending_text_load', JSON.stringify(payload));
+                
+                // Open the tab (reusing the same name as the editor does)
+                window.open('pdf_converter.html', 'audiogen_pdf_tab');
+                
+                // Also broadcast for hot-reload if the tab is already open
+                const bc = new BroadcastChannel('studio_text_bridge');
+                bc.postMessage(payload);
+                bc.close();
+            };
+
+            const handleLoadNoteSession = (session) => {
+                const stored = localStorage.getItem(session.id);
+                if (!stored) return;
+                
+                let notes = [];
+                try {
+                    const parsed = JSON.parse(stored);
+                    if (Array.isArray(parsed)) {
+                        notes = parsed;
+                    } else if (parsed.notes) {
+                        notes = parsed.notes;
+                    }
+                } catch (e) { return; }
+
+                // Format notes into a readable text document
+                const textContent = notes
+                    .map(n => `[${formatTime(n.timestamp)}] ${n.text}`)
+                    .join('\n\n');
+
+                const payload = { 
+                    type: 'LOAD_TEXT', 
+                    text: textContent || "No notes text found.", 
+                    fileName: `notes_from_${session.fileName}.txt` 
+                };
+                
+                sessionStorage.setItem('studio_pending_text_load', JSON.stringify(payload));
+                window.open('pdf_converter.html', 'audiogen_pdf_tab');
+                
+                const bc = new BroadcastChannel('studio_text_bridge');
+                bc.postMessage(payload);
+                bc.close();
+            };
+
+            const ITEMS_PER_PAGE = 5;
+
+            // PDF History Pagination
+            const totalPdfPages = Math.ceil(pdfHistory.length / ITEMS_PER_PAGE);
+            const paginatedPdfHistory = pdfHistory.slice(
+                (pdfHistoryPage - 1) * ITEMS_PER_PAGE,
+                pdfHistoryPage * ITEMS_PER_PAGE
+            );
+
+            // Note Sessions Pagination & Filtering
+            const filteredSessions = noteSessions
+                .filter(session => session.fileName.toLowerCase().includes(searchQuery.toLowerCase()))
+                .sort((a, b) => {
+                    if (sortOption === 'date') return b.lastTimestamp - a.lastTimestamp;
+                    if (sortOption === 'name') return a.fileName.localeCompare(b.fileName);
+                    return 0;
+                });
+            
+            const totalNotesPages = Math.ceil(filteredSessions.length / ITEMS_PER_PAGE);
+            const paginatedSessions = filteredSessions.slice((notesPage - 1) * ITEMS_PER_PAGE, notesPage * ITEMS_PER_PAGE);
+
+            return (
+                <div className="max-w-6xl mx-auto p-6">
+                    <header className="mb-10 border-b border-slate-700 pb-4">
+                        <h1 className="text-3xl font-bold text-cyan-400 neon-text tracking-tight">Studio<span className="text-slate-500">.projects</span></h1>
+                        <p className="text-slate-400 text-sm mt-1">Central Dashboard</p>
+                    </header>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                        
+                        {/* Tool Launchers */}
+                        <div className="col-span-1 lg:col-span-3 grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+                            <a href="pdf_converter.html" className="studio-panel p-6 rounded-xl hover:border-cyan-500 transition-colors group flex items-center justify-between">
+                                <div>
+                                    <h2 className="text-xl font-bold text-white group-hover:text-cyan-400">PDF to Speech</h2>
+                                    <p className="text-slate-400 text-sm">Convert documents to audio</p>
+                                </div>
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8 text-slate-600 group-hover:text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
+                            </a>
+                            <a href="notetaker.html" className="studio-panel p-6 rounded-xl hover:border-cyan-500 transition-colors group flex items-center justify-between">
+                                <div>
+                                    <h2 className="text-xl font-bold text-white group-hover:text-cyan-400">Audio NoteTaker</h2>
+                                    <p className="text-slate-400 text-sm">Annotate audio files</p>
+                                </div>
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8 text-slate-600 group-hover:text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                            </a>
+                            <a href="pdf_editor.html" className="studio-panel p-6 rounded-xl hover:border-cyan-500 transition-colors group flex items-center justify-between">
+                                <div>
+                                    <h2 className="text-xl font-bold text-white group-hover:text-cyan-400">PDF Editor</h2>
+                                    <p className="text-slate-400 text-sm">Extract & Clean Text</p>
+                                </div>
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8 text-slate-600 group-hover:text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
+                            </a>
+                        </div>
+
+                        {/* PDF History List */}
+                        <div className="studio-panel rounded-xl p-6 lg:col-span-1">
+                            <h2 className="text-lg font-semibold text-slate-300 mb-4 flex items-center">
+                                <span className="w-2 h-2 bg-purple-500 rounded-full mr-2"></span>
+                                Recent Conversions
+                            </h2>
+                            <div className="space-y-3 max-h-[400px] overflow-y-auto">
+                                {pdfHistory.length === 0 ? (
+                                    <p className="text-slate-500 italic text-sm">No conversion history found.</p>
+                                ) : paginatedPdfHistory.length === 0 ? (
+                                    <p className="text-slate-500 italic text-sm">No history on this page.</p>
+                                ) : (
+                                    paginatedPdfHistory.map((item, idx) => (
+                                        <div key={idx} className="bg-slate-900/50 p-3 rounded border border-slate-700 group relative">
+                                            <div className="flex justify-between items-start mb-1">
+                                                <span className="text-xs font-bold text-purple-400">{item.voiceName || 'Voice'}</span>
+                                                <span className="text-[10px] text-slate-500">{item.timestamp}</span>
+                                            </div>
+                                            <p className="text-xs text-slate-400 line-clamp-2">"{item.text}"</p>
+                                            <div className="absolute inset-0 bg-slate-900/90 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity rounded">
+                                                <button 
+                                                    onClick={() => handleLoadPdfHistory(item)}
+                                                    className="px-3 py-1 bg-purple-600 hover:bg-purple-500 text-white text-xs rounded font-bold shadow-lg"
+                                                >
+                                                    Load into Generator
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                            <div className="flex justify-end items-center mt-4 text-xs space-x-2 text-slate-400">
+                                {totalPdfPages > 1 && (
+                                    <>
+                                        <button onClick={() => setPdfHistoryPage(p => p - 1)} disabled={pdfHistoryPage === 1} className="px-2 py-1 bg-slate-700 rounded disabled:opacity-50 disabled:cursor-not-allowed hover:bg-slate-600">Prev</button>
+                                        <span>Page {pdfHistoryPage} of {totalPdfPages}</span>
+                                        <button onClick={() => setPdfHistoryPage(p => p + 1)} disabled={pdfHistoryPage === totalPdfPages} className="px-2 py-1 bg-slate-700 rounded disabled:opacity-50 disabled:cursor-not-allowed hover:bg-slate-600">Next</button>
+                                    </>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* NoteTaker Sessions List */}
+                        <div className="studio-panel rounded-xl p-6 lg:col-span-1">
+                            <h2 className="text-lg font-semibold text-slate-300 mb-4 flex items-center">
+                                <div className="flex items-center flex-1">
+                                    <span className="w-2 h-2 bg-cyan-500 rounded-full mr-2"></span>
+                                    Saved Note Sessions
+                                </div>
+                                <div className="flex items-center space-x-2">
+                                    <select
+                                        value={sortOption}
+                                        onChange={(e) => setSortOption(e.target.value)}
+                                        className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-cyan-500 outline-none"
+                                    >
+                                        <option value="date">Date</option>
+                                        <option value="name">Name</option>
+                                    </select>
+                                    <input 
+                                        type="text" 
+                                        placeholder="Search projects..." 
+                                        value={searchQuery}
+                                        onChange={(e) => setSearchQuery(e.target.value)}
+                                        className="bg-slate-900 border border-slate-700 rounded px-3 py-1 text-xs text-slate-200 focus:outline-none focus:border-cyan-500 placeholder-slate-500 w-28 transition-colors"
+                                    />
+                                </div>
+                            </h2>
+                            <div className="space-y-3 max-h-[400px] overflow-y-auto">
+                                {noteSessions.length === 0 ? (
+                                    <p className="text-slate-500 italic text-sm">No note sessions found.</p>
+                                ) : paginatedSessions.length === 0 ? (
+                                    <p className="text-slate-500 italic text-sm">No projects match your search.</p>
+                                ) : (
+                                    paginatedSessions.map((session) => (
+                                        <div key={session.id} className="bg-slate-900/50 p-3 rounded border border-slate-700 flex justify-between items-center">
+                                            <div>
+                                                <h3 className="text-sm font-medium text-slate-200 truncate max-w-[200px]" title={session.fileName}>{session.fileName}</h3>
+                                                <p className="text-[10px] text-slate-500">Last note at {formatTime(session.lastTimestamp)}</p>
+                                            </div>
+                                            <div className="flex items-center space-x-3">
+                                                <span className="text-xs bg-slate-800 px-2 py-1 rounded text-cyan-400">{session.noteCount} notes</span>
+                                                {/* 
+                                                    Note: Opening specific sessions in NoteTaker is tricky without a file object.
+                                                    We link to the tool generally.
+                                                */}
+                                                <div className="flex space-x-1">
+                                                    <button onClick={() => handleLoadNoteSession(session)} className="text-[10px] bg-purple-600 hover:bg-purple-500 text-white px-2 py-1 rounded transition-colors font-bold" title="Load Notes into Generator">Load</button>
+                                                    <button onClick={() => exportSession(session, 'csv')} className="text-[10px] bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-1 rounded transition-colors" title="Save Project as CSV">CSV</button>
+                                                    <button onClick={() => exportSession(session, 'json')} className="text-[10px] bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-1 rounded transition-colors" title="Save Project as JSON">JSON</button>
+                                                </div>
+                                                <a href="notetaker.html" className="text-slate-400 hover:text-white">
+                                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
+                                                </a>
+                                            </div>
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                            <div className="flex justify-end items-center mt-4 text-xs space-x-2 text-slate-400">
+                                {totalNotesPages > 1 && (
+                                    <>
+                                        <button onClick={() => setNotesPage(p => p - 1)} disabled={notesPage === 1} className="px-2 py-1 bg-slate-700 rounded disabled:opacity-50 disabled:cursor-not-allowed hover:bg-slate-600">Prev</button>
+                                        <span>Page {notesPage} of {totalNotesPages}</span>
+                                        <button onClick={() => setNotesPage(p => p + 1)} disabled={notesPage === totalNotesPages} className="px-2 py-1 bg-slate-700 rounded disabled:opacity-50 disabled:cursor-not-allowed hover:bg-slate-600">Next</button>
+                                    </>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* PDF Editor Project */}
+                        <div className="studio-panel rounded-xl p-6 lg:col-span-1">
+                            <h2 className="text-lg font-semibold text-slate-300 mb-4 flex items-center">
+                                <span className="w-2 h-2 bg-green-500 rounded-full mr-2"></span>
+                                Current Editor Project
+                            </h2>
+                            <div className="space-y-3">
+                                {!editorProject ? (
+                                    <p className="text-slate-500 italic text-sm">No editor project found.</p>
+                                ) : (
+                                    <div className="bg-slate-900/50 p-3 rounded border border-slate-700">
+                                        <div className="flex justify-between items-start mb-1">
+                                            <h3 className="text-sm font-medium text-slate-200 truncate max-w-[200px]" title={editorProject.fileName}>{editorProject.fileName}</h3>
+                                            <a href="pdf_editor.html" className="text-slate-400 hover:text-white" title="Open in Editor">
+                                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
+                                            </a>
+                                        </div>
+                                        <p className="text-xs text-slate-400 line-clamp-2">"{editorProject.text}"</p>
+                                        <p className="text-[10px] text-slate-500 mt-2 text-right">Last modified: {editorProject.lastModified}</p>
+                                    </div>
+                                )}
+                            </div>
+                            <p className="text-[10px] text-slate-600 italic mt-4">The PDF Editor currently saves only the most recent session.</p>
+                        </div>
+
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<Dashboard />);
+    </script>
+</body>
+</html>

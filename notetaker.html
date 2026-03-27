@@ -1,0 +1,1720 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Studio Audio Notetaker</title>
+    <!-- Allow unsafe-eval for Babel standalone -->
+    <meta http-equiv="Content-Security-Policy" content="script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://cdn.tailwindcss.com https://cdnjs.cloudflare.com; worker-src 'self' blob: https://cdnjs.cloudflare.com;">
+    
+    <!-- Dependencies -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.min.js"></script>
+    <script src="https://unpkg.com/wavesurfer.js@7/dist/plugins/regions.min.js"></script>
+    <script src="https://unpkg.com/wavesurfer.js@7/dist/plugins/minimap.min.js"></script>
+
+    <!-- Custom Styles -->
+    <style>
+        body {
+            background-color: #0f172a; /* Slate 900 */
+            color: #e2e8f0; /* Slate 200 */
+        }
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #1e293b;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #475569;
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #64748b;
+        }
+        .studio-panel {
+            background-color: #1e293b; /* Slate 800 */
+            border: 1px solid #334155; /* Slate 700 */
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5);
+        }
+        .neon-text {
+            text-shadow: 0 0 10px rgba(34, 211, 238, 0.5);
+        }
+        .region-highlight {
+            filter: brightness(200%);
+            box-shadow: 0 0 8px 4px rgba(255, 255, 255, 0.6);
+            z-index: 10 !important;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        const DEFAULT_CATEGORIES = [
+            { id: 'cat-1', name: 'General', color: '#22d3ee' }, // Cyan
+            { id: 'cat-2', name: 'Important', color: '#facc15' }, // Yellow
+            { id: 'cat-3', name: 'Question', color: '#c084fc' }, // Purple
+            { id: 'cat-4', name: 'Action Item', color: '#4ade80' }, // Green
+            { id: 'cat-5', name: 'Issue', color: '#f87171' }, // Red
+        ];
+
+        const EXTRA_COLORS_PALETTE = [
+            '#fb923c', // orange-400
+            '#f472b6', // pink-400
+            '#60a5fa', // blue-400
+        ];
+
+        // This constant is not used with the new category system, but kept for reference or potential fallback.
+        const NOTE_COLORS = DEFAULT_CATEGORIES.map(c => c.color);
+
+
+        // --- Helper: Format seconds to MM:SS.ms ---
+        const formatTime = (seconds) => {
+            if (!seconds) return "00:00";
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.floor(seconds % 60);
+            const ms = Math.floor((seconds % 1) * 10); // just one decimal for brevity
+            return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+        };
+
+        const formatTimeForSubtitles = (seconds, useComma = false) => {
+            if (seconds === null || seconds === undefined) return "00:00:00" + (useComma ? ",000" : ".000");
+            const date = new Date(seconds * 1000);
+            const iso = date.toISOString();
+            // 1970-01-01T00:00:00.000Z -> 00:00:00.000
+            let time = iso.slice(11, 23); 
+            if (useComma) {
+                time = time.replace('.', ',');
+            }
+            return time;
+        };
+
+        const parseSubtitleTimestamp = (t) => {
+            if (!t) return null;
+            t = t.trim().replace(',', '.');
+            const parts = t.split(':');
+            if (parts.length === 3) {
+                return parseInt(parts[0], 10) * 3600 + parseInt(parts[1], 10) * 60 + parseFloat(parts[2]);
+            } else if (parts.length === 2) {
+                return parseInt(parts[0], 10) * 60 + parseFloat(parts[1]);
+            }
+            return parseFloat(t);
+        };
+
+        const splitTextIntoSentences = (content) => {
+            return content.match(/[^.!?\r\n]+[.!?\r\n]*(\s+|$)/g) || [content];
+        };
+
+        const TranscriptViewer = ({ text, sentences, currentStart, currentTime, currentWordStart, onSentenceClick, searchQuery, forceScroll }) => {
+            const highlightedSentenceRef = useRef(null);
+
+            useEffect(() => {
+                if (highlightedSentenceRef.current) {
+                    highlightedSentenceRef.current.scrollIntoView({
+                        // Use 'auto' if the user is scrolling manually? 
+                        // But for "follow along", 'smooth' is nice but can be laggy.
+                        // 'nearest' is less jumpy. Let's try 'center' with smooth.
+                        // If it's not scrolling, it might be because the ref isn't attached.
+                        behavior: 'smooth', 
+                        block: 'center',
+                    });
+                }
+            }, [currentStart, forceScroll]);
+
+            if (!text) {
+                return <div className="text-center text-slate-600 py-10 italic">No transcript available for this audio.</div>;
+            }
+
+            // If we have text but no timing data (manual load), just show the text
+            if (sentences.length === 0) {
+                return <div className="font-serif text-base leading-relaxed whitespace-pre-wrap text-slate-300">{text}</div>;
+            }
+
+            const renderHighlightedText = (content) => {
+                if (!searchQuery || !content) return content;
+                const escapedQuery = searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const parts = content.split(new RegExp(`(${escapedQuery})`, 'gi'));
+                return parts.map((part, i) => 
+                    part.toLowerCase() === searchQuery.toLowerCase() 
+                        ? <span key={i} className="bg-purple-600/50 text-white rounded px-0.5 font-bold">{part}</span> 
+                        : part
+                );
+            };
+
+            let lastIndex = 0;
+            const parts = [];
+
+            sentences.forEach((sentence, i) => {
+                let sentenceIndex = text.indexOf(sentence.text, lastIndex);
+                let matchLength = sentence.text.length;
+
+                // Flexible matching: handles whitespace/newline differences between transcript and sentence data
+                if (sentenceIndex === -1) {
+                    const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    const words = sentence.text.trim().split(/\s+/);
+                    if (words.length > 0) {
+                        const pattern = words.map(escapeRegExp).join('[\\s\\r\\n]+');
+                        try {
+                            const regex = new RegExp(pattern, 'g');
+                            regex.lastIndex = lastIndex;
+                            const match = regex.exec(text);
+                            if (match) {
+                                sentenceIndex = match.index;
+                                matchLength = match[0].length;
+                            }
+                        } catch (e) {}
+                    }
+                }
+
+                const isHighlighted = sentence.start === currentStart;
+                const isSynced = sentence.start !== null && sentence.start !== undefined;
+                let sentenceContent;
+                
+                const renderSentenceWords = (contentStr) => {
+                    if (isHighlighted && sentence.words && sentence.words.length > 0) {
+                        const wordsWithSpaces = [];
+                        sentence.words.forEach((word, wordIndex) => {
+                            const isWordHighlighted = word.start === currentWordStart;
+                            const isSearchMatch = searchQuery && word.word.toLowerCase().includes(searchQuery.toLowerCase());
+                            
+                            wordsWithSpaces.push(
+                                <span key={wordIndex} className={isWordHighlighted ? 'bg-cyan-400 text-slate-900 rounded px-1 font-bold shadow-md inline-block transform scale-105 transition-all' : (isSearchMatch ? 'bg-purple-600/50 text-white rounded px-0.5 font-bold' : '')}>
+                                    {word.word}
+                                </span>
+                            );
+                            if (wordIndex < sentence.words.length - 1) {
+                                wordsWithSpaces.push(<span key={`space-${wordIndex}`}> </span>);
+                            }
+                        });
+                        return wordsWithSpaces;
+                    }
+
+                    // Case 2: Simulated Karaoke (Sentence timestamps only)
+                    if (isHighlighted && sentence.end && (currentTime !== null && currentTime !== undefined) && contentStr.length > 0) {
+                        const words = contentStr.split(/(\s+)/); // Split keeping whitespace
+                        const totalLength = contentStr.length;
+                        const duration = sentence.end - sentence.start;
+                        
+                        let charAccumulator = 0;
+                        return words.map((part, index) => {
+                             const partLength = part.length;
+                             const wordStart = sentence.start + (duration * (charAccumulator / totalLength));
+                             const wordEnd = sentence.start + (duration * ((charAccumulator + partLength) / totalLength));
+                             charAccumulator += partLength;
+
+                             if (part.trim().length === 0) return part; // Return whitespace as is
+
+                             const isCurrent = currentTime >= wordStart && currentTime < wordEnd;
+                             return isCurrent ? <span key={index} className="bg-cyan-400 text-slate-900 rounded px-1 font-bold shadow-md inline-block transform scale-105 transition-all">{part}</span> : renderHighlightedText(part);
+                        });
+                    }
+                    
+                    return renderHighlightedText(contentStr);
+                };
+
+                if (sentenceIndex !== -1) {
+                    if (sentenceIndex > lastIndex) {
+                        parts.push(<span key={`pre-${i}`}>{renderHighlightedText(text.substring(lastIndex, sentenceIndex))}</span>);
+                    }
+                    
+                    sentenceContent = renderSentenceWords(text.substring(sentenceIndex, sentenceIndex + matchLength));
+
+                    parts.push(
+                        <span 
+                            key={i} 
+                            ref={isHighlighted ? highlightedSentenceRef : null}
+                            onClick={(e) => onSentenceClick(sentence, i, e)}
+                            className={`${isHighlighted ? 'bg-cyan-900/50 text-cyan-50 rounded shadow-[0_0_15px_rgba(34,211,238,0.1)] box-decoration-clone px-1 py-0.5' : 'text-slate-400'} ${isSynced ? 'cursor-pointer hover:text-cyan-400' : 'cursor-crosshair hover:bg-slate-700/50'} transition-all duration-200`}
+                            title={isSynced ? `Jump to ${formatTime(sentence.start)} (Option+Click re-sync, Shift+Click edit)` : "Click to sync (Shift+Click edit)"}
+                        >
+                            {isSynced && (
+                                <span className="inline-block mr-1 opacity-30 select-none align-middle text-cyan-500">
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" /></svg>
+                                </span>
+                            )}
+                            {sentenceContent}
+                        </span>
+                    );
+                    lastIndex = sentenceIndex + matchLength;
+                } else {
+                    // Fallback: Sentence text not found in transcript string. 
+                    // Render it anyway to ensure highlighting/scrolling works.
+                    sentenceContent = renderSentenceWords(sentence.text);
+                    parts.push(
+                        <span 
+                            key={i} 
+                            ref={isHighlighted ? highlightedSentenceRef : null}
+                            onClick={(e) => onSentenceClick(sentence, i, e)}
+                            className={`${isHighlighted ? 'bg-cyan-900/50 text-cyan-50 rounded shadow-[0_0_15px_rgba(34,211,238,0.1)] box-decoration-clone px-1 py-0.5' : 'text-slate-400'} ${isSynced ? 'cursor-pointer hover:text-cyan-400' : 'cursor-crosshair hover:bg-slate-700/50'} transition-all duration-200`}
+                            title={isSynced ? `Jump to ${formatTime(sentence.start)} (Option+Click re-sync, Shift+Click edit)` : "Click to sync (Shift+Click edit)"}
+                        >
+                            {isSynced && (
+                                <span className="inline-block mr-1 opacity-30 select-none align-middle text-cyan-500">
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" /></svg>
+                                </span>
+                            )}
+                            {sentenceContent}
+                        </span>
+                    );
+                    // Add a space to separate from next fallback element
+                    parts.push(<span key={`gap-${i}`}> </span>);
+                }
+            });
+
+            if (lastIndex < text.length) {
+                parts.push(<span key="post">{renderHighlightedText(text.substring(lastIndex))}</span>);
+            }
+
+            return (
+                <div className="flex relative gap-4">
+                    <div className="font-serif text-base leading-relaxed whitespace-pre-wrap flex-1">
+                        {parts}
+                    </div>
+                    
+                    {/* Minimap Visualization */}
+                    <div className="w-12 flex-shrink-0 hidden sm:block select-none relative z-10">
+                         <div className="sticky top-0 flex flex-col gap-[2px] py-2 max-h-[500px] overflow-y-auto">
+                            {sentences.map((s, i) => {
+                                 const isCurrent = s.start === currentStart;
+                                 const isSearchMatch = searchQuery && s.text.toLowerCase().includes(searchQuery.toLowerCase());
+                                 // Approximate "height" of the sentence in the minimap based on length
+                                 // Short sentences 2px, long ones up to 12px
+                                 const height = Math.max(2, Math.min(12, Math.ceil(s.text.length / 25)));
+                                 
+                                 return (
+                                     <div 
+                                        key={i}
+                                        onClick={(e) => onSentenceClick(s, i, e)}
+                                        className={`w-full rounded-[1px] cursor-pointer transition-all duration-150 ${
+                                            isCurrent 
+                                                ? 'bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)] scale-110 z-20' 
+                                                : isSearchMatch 
+                                                    ? 'bg-purple-500 opacity-90' 
+                                                    : 'bg-slate-700/30 hover:bg-slate-600/80'
+                                        }`}
+                                        style={{ height: `${height}px`, minHeight: isCurrent ? '4px' : '2px' }}
+                                        title={`${formatTime(s.start)}: ${s.text.substring(0, 50)}...`}
+                                     />
+                                 );
+                            })}
+                         </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const AudioNotetaker = () => {
+            // --- State ---
+            const [audioFile, setAudioFile] = useState(null);
+            const [fileName, setFileName] = useState("");
+            const [isPlaying, setIsPlaying] = useState(false);
+            const [currentTime, setCurrentTime] = useState(0);
+            const [duration, setDuration] = useState(0);
+            const [notes, setNotes] = useState([]);
+            const [isReady, setIsReady] = useState(false);
+            const [searchQuery, setSearchQuery] = useState("");
+            const [playbackRate, setPlaybackRate] = useState(1);
+            const [volume, setVolume] = useState(1);
+            const [isLooping, setIsLooping] = useState(false);
+            const [zoom, setZoom] = useState(50);
+            const [loopArmed, setLoopArmed] = useState(false);
+            const [categories, setCategories] = useState(() => {
+               const saved = localStorage.getItem('notetaker_categories');
+               if (saved) return JSON.parse(saved);
+               return DEFAULT_CATEGORIES;
+            });
+            const [showCategoryManager, setShowCategoryManager] = useState(false);
+            const [openDropdownId, setOpenDropdownId] = useState(null);
+            const [editingNoteId, setEditingNoteId] = useState(null);
+            const [tempTimestamp, setTempTimestamp] = useState("");
+            const [transcript, setTranscript] = useState("");
+            const [sentenceBoundaries, setSentenceBoundaries] = useState([]);
+            const [showTranscriptLoader, setShowTranscriptLoader] = useState(false);
+            const [currentSentenceStart, setCurrentSentenceStart] = useState(-1);
+            const [transcriptSearchQuery, setTranscriptSearchQuery] = useState("");
+            const [currentWordStart, setCurrentWordStart] = useState(-1);
+            const [forceScrollTrigger, setForceScrollTrigger] = useState(0);
+            const [editingSentenceIndex, setEditingSentenceIndex] = useState(null);
+            const [editSentenceStart, setEditSentenceStart] = useState("");
+            const [editSentenceEnd, setEditSentenceEnd] = useState("");
+            const [editSentenceText, setEditSentenceText] = useState("");
+            const [isEditingTranscript, setIsEditingTranscript] = useState(false);
+            const [tempTranscriptText, setTempTranscriptText] = useState("");
+
+            // --- Refs ---
+            const waveformRef = useRef(null);
+            const minimapRef = useRef(null);
+            const ws = useRef(null);
+            const wsRegions = useRef(null);
+            const fileInputRef = useRef(null);
+            const audioCtxRef = useRef(null);
+            const analyserRef = useRef(null);
+            const rafRef = useRef(null);
+            const loopRegionRef = useRef(null);
+            const dragCleanupRef = useRef(null);
+            const isLoopingRef = useRef(false);
+            const loopArmedRef = useRef(false);
+
+            // --- Sync Refs with State ---
+            useEffect(() => { isLoopingRef.current = isLooping; }, [isLooping]);
+            useEffect(() => { loopArmedRef.current = loopArmed; }, [loopArmed]);
+
+            // --- Broadcast Channel Listener (Workflow Integration) ---
+            useEffect(() => {
+                const bc = new BroadcastChannel('studio_audio_bridge');
+                bc.onmessage = (event) => {
+                    if (event.data && (event.data.type === 'LOAD_AUDIO' || event.data.type === 'LOAD_AUDIO_WITH_TRANSCRIPT')) {
+                        const { blob, name } = event.data;
+                        const file = new File([blob], name, { type: 'audio/mpeg' });
+                        
+                        setIsReady(false);
+                        setIsPlaying(false);
+                        setFileName(name);
+                        setAudioFile(file);
+                        setPlaybackRate(1);
+                        setIsLooping(false);
+                        setLoopArmed(false);
+                        setZoom(50);
+
+                        if (event.data.type === 'LOAD_AUDIO_WITH_TRANSCRIPT') {
+                            setTranscript(event.data.transcript || "");
+                            setSentenceBoundaries(event.data.boundaries || []);
+                        } else {
+                            // Reset for plain audio files
+                            setTranscript("");
+                            setSentenceBoundaries([]);
+                        }
+                    }
+                };
+
+                return () => bc.close();
+            }, []);
+
+            // --- Load Notes from LocalStorage when file changes ---
+            useEffect(() => {
+                if (fileName) {
+                    const saved = localStorage.getItem(`session_${fileName}`);
+                    if (saved) {
+                        const sessionData = JSON.parse(saved);
+                        setNotes(sessionData.notes || []);
+                        setTranscript(sessionData.transcript || "");
+                        setSentenceBoundaries(sessionData.boundaries || []);
+                    } else {
+                        // Fallback for old format
+                        const oldNotes = localStorage.getItem(`notes_${fileName}`);
+                        if (oldNotes) {
+                            setNotes(JSON.parse(oldNotes));
+                        } else {
+                            setNotes([]);
+                        }
+                        setTranscript("");
+                        setSentenceBoundaries([]);
+                    }
+                }
+            }, [fileName]);
+
+            // --- Save Session to LocalStorage when data changes ---
+            useEffect(() => {
+                if (fileName) {
+                    const sessionData = {
+                        notes,
+                        transcript,
+                        boundaries: sentenceBoundaries
+                    };
+                    localStorage.setItem(`session_${fileName}`, JSON.stringify(sessionData));
+                }
+            }, [notes, transcript, sentenceBoundaries, fileName]);
+
+            useEffect(() => {
+               localStorage.setItem('notetaker_categories', JSON.stringify(categories));
+            }, [categories]);
+
+            // Effect to close dropdown on outside click
+            useEffect(() => {
+                const handleClickOutside = (event) => {
+                    if (openDropdownId && !event.target.closest('.category-dropdown-container')) {
+                        setOpenDropdownId(null);
+                    }
+                };
+                document.addEventListener('mousedown', handleClickOutside);
+                return () => document.removeEventListener('mousedown', handleClickOutside);
+            }, [openDropdownId]);
+
+            // --- Initialize WaveSurfer ---
+            useEffect(() => {
+                if (!audioFile || !waveformRef.current) return;
+
+                // Create WaveSurfer instance
+                ws.current = WaveSurfer.create({
+                    container: waveformRef.current,
+                    waveColor: '#475569',      // Slate 600
+                    progressColor: '#22d3ee',  // Cyan 400 (Neon)
+                    cursorColor: '#f472b6',    // Red/Pink for visibility
+                    barWidth: 2,
+                    barGap: 3,
+                    barRadius: 3,
+                    height: 128,
+                    normalize: true,
+                    minPxPerSec: 50,
+                    volume: volume,
+                });
+
+                // Initialize and register the Regions plugin
+                const regions = ws.current.registerPlugin(WaveSurfer.Regions.create());
+                wsRegions.current = regions;
+
+                // Register Minimap
+                ws.current.registerPlugin(WaveSurfer.Minimap.create({
+                    container: minimapRef.current,
+                    height: 40,
+                    waveColor: '#334155',      // Slate 700
+                    progressColor: '#0e7490',  // Cyan 700
+                    cursorWidth: 0,            // Hide cursor on minimap for cleaner look
+                    dragToSeek: true
+                }));
+
+                // Load audio
+                const objectUrl = URL.createObjectURL(audioFile);
+                ws.current.load(objectUrl);
+
+                // Events
+                const subs = [
+                    ws.current.on('ready', () => {
+                        setIsReady(true);
+                        const dur = ws.current.getDuration();
+                        setDuration(dur);
+                        
+                        // Auto-sync text if loaded before audio
+                        if (sentenceBoundaries.length > 0 && sentenceBoundaries[0].start === null) {
+                             const totalChars = sentenceBoundaries.reduce((acc, s) => acc + s.text.length, 0);
+                             let accumulatedTime = 0;
+                             const newBoundaries = sentenceBoundaries.map(s => {
+                                 const sDur = totalChars > 0 ? (s.text.length / totalChars) * dur : 0;
+                                 const start = accumulatedTime;
+                                 const end = accumulatedTime + sDur;
+                                 accumulatedTime += sDur;
+                                 return { ...s, start, end };
+                             });
+                             setSentenceBoundaries(newBoundaries);
+                        }
+                    }),
+                    ws.current.on('audioprocess', (time) => {
+                        setCurrentTime(time);
+
+                        // Update for transcript highlighting
+                        if (sentenceBoundaries.length > 0) {
+                            const currentSentence = sentenceBoundaries.find(
+                                (s) => time >= s.start && (s.end ? time < s.end : true)
+                            );
+                            if (currentSentence) {
+                                if (currentSentence.start !== currentSentenceStart) setCurrentSentenceStart(currentSentence.start);
+                                
+                                const currentWord = currentSentence.words?.find(w => time >= w.start && time < w.end);
+                                if (currentWord) {
+                                    if (currentWord.start !== currentWordStart) setCurrentWordStart(currentWord.start);
+                                } else {
+                                    if (currentWordStart !== -1) setCurrentWordStart(-1);
+                                }
+                            } else {
+                                if (currentSentenceStart !== -1) setCurrentSentenceStart(-1);
+                                if (currentWordStart !== -1) setCurrentWordStart(-1);
+                            }
+                        }
+
+                        // Robust loop check using Ref to access current state
+                        if (isLoopingRef.current && loopRegionRef.current && time >= loopRegionRef.current.end) {
+                            ws.current.setTime(loopRegionRef.current.start);
+                        }
+                    }),
+                    ws.current.on('timeupdate', (time) => {
+                        setCurrentTime(time);
+                    }),
+                    ws.current.on('play', () => setIsPlaying(true)),
+                    ws.current.on('pause', () => setIsPlaying(false)),
+                    ws.current.on('finish', () => setIsPlaying(false)),
+                    regions.on('region-clicked', (region, e) => {
+                        e.stopPropagation();
+                        if (region.id === 'loop-region') {
+                            region.play();
+                        } else {
+                            ws.current.setTime(region.start);
+                        }
+                    }),
+                    regions.on('region-out', (region) => {
+                        // When playback leaves a loop region, jump back to the start if looping is active
+                        // Use isLoopingRef to ensure we read the latest state inside the callback
+                        if (region.id === 'loop-region' && isLoopingRef.current && ws.current.isPlaying()) {
+                            ws.current.setTime(region.start);
+                        }
+                    }),
+                    regions.on('region-created', (newRegion) => {
+                        // This event fires after a region is drawn by the user.
+                        // Use loopArmedRef to check state inside the closure
+                        if (loopArmedRef.current) {
+                            // 1. Remove any other pre-existing loop regions.
+                            wsRegions.current.getRegions().forEach(r => {
+                                if (r.id === 'loop-region' && r !== newRegion) r.remove();
+                            });
+                            
+                            // 2. Finalize the new region's properties.
+                            newRegion.id = 'loop-region';
+                            newRegion.loop = true;
+                            newRegion.color = 'rgba(251, 113, 133, 0.2)'; // A distinct rose color for the loop
+                            newRegion.drag = true;
+                            newRegion.resize = true;
+                            
+                            // 3. Update state & play
+                            loopRegionRef.current = newRegion;
+                            setIsLooping(true);
+                            setIsPlaying(true);
+                            setLoopArmed(false); // Disarm the drawing mode.
+                            if (dragCleanupRef.current) {
+                                dragCleanupRef.current();
+                                dragCleanupRef.current = null;
+                            }
+                            newRegion.play();
+                        }
+                    }),
+                ];
+
+                // Cleanup
+                return () => {
+                    subs.forEach(unsub => unsub());
+                    if (ws.current) {
+                        ws.current.destroy();
+                    }
+                    URL.revokeObjectURL(objectUrl);
+                };
+            }, [audioFile]);
+
+            // --- Audio Analyzer Setup ---
+            useEffect(() => {
+                if (!isReady || !ws.current) return;
+
+                const media = ws.current.getMediaElement();
+                if (!media) return;
+
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const analyser = ctx.createAnalyser();
+                analyser.fftSize = 512;
+
+                try {
+                    const source = ctx.createMediaElementSource(media);
+                    source.connect(analyser);
+                    analyser.connect(ctx.destination);
+                    
+                    audioCtxRef.current = ctx;
+                    analyserRef.current = analyser;
+                } catch (e) {
+                    console.error("Audio Context setup failed:", e);
+                }
+
+                return () => {
+                    if (ctx.state !== 'closed') ctx.close();
+                };
+            }, [isReady]);
+
+            // --- Visualizer Loop ---
+            useEffect(() => {
+                if (!isPlaying || !analyserRef.current || !waveformRef.current) {
+                    cancelAnimationFrame(rafRef.current);
+                    if (waveformRef.current) waveformRef.current.style.filter = 'none';
+                    return;
+                }
+
+                const updateVisuals = () => {
+                    const bufferLength = analyserRef.current.frequencyBinCount;
+                    const dataArray = new Uint8Array(bufferLength);
+                    analyserRef.current.getByteFrequencyData(dataArray);
+                    
+                    const avg = dataArray.reduce((a, b) => a + b, 0) / bufferLength;
+                    const hue = Math.floor(avg * 2); // Rotate hue based on intensity
+                    const brightness = 1 + (avg / 255); // Boost brightness
+                    
+                    if (waveformRef.current) {
+                        waveformRef.current.style.filter = `hue-rotate(${hue}deg) brightness(${brightness})`;
+                    }
+                    
+                    rafRef.current = requestAnimationFrame(updateVisuals);
+                };
+
+                updateVisuals();
+
+                return () => cancelAnimationFrame(rafRef.current);
+            }, [isPlaying]);
+
+            // --- Sync Notes to Regions ---
+            useEffect(() => {
+                if (!wsRegions.current || !isReady) return;
+
+                // Clear only note regions, preserve the loop region
+                wsRegions.current.getRegions().forEach(r => {
+                    if (r.id !== 'loop-region') {
+                        r.remove();
+                    }
+                });
+
+                notes.forEach(note => {
+                    wsRegions.current.addRegion({
+                        id: note.id.toString(),
+                        start: note.timestamp,
+                        color: note.color || (categories[0]?.color || '#22d3ee'),
+                        drag: false,
+                        resize: false
+                    });
+                });
+            }, [notes, isReady]);
+
+            // --- Keyboard Shortcuts ---
+            useEffect(() => {
+                const handleKeyDown = (e) => {
+                    if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
+                    if (!isReady || !ws.current) return;
+
+                    switch (e.key.toLowerCase()) {
+                        case 'j':
+                            ws.current.skip(-5);
+                            break;
+                        case 'k':
+                            if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+                                audioCtxRef.current.resume();
+                            }
+                            ws.current.playPause();
+                            break;
+                        case 'l':
+                            ws.current.skip(5);
+                            break;
+                        case 'r':
+                            toggleLoop();
+                            break;
+                    }
+                };
+
+                window.addEventListener('keydown', handleKeyDown);
+                return () => window.removeEventListener('keydown', handleKeyDown);
+            }, [isReady]);
+
+            // --- Handlers ---
+
+            const handleFileUpload = (e) => {
+                const file = e.target.files[0];
+                if (file) {
+                    setIsReady(false);
+                    setIsPlaying(false);
+                    setFileName(file.name);
+                    setAudioFile(file);
+                    setPlaybackRate(1);
+                    setIsLooping(false);
+                    setLoopArmed(false);
+                    setZoom(50);
+                }
+            };
+
+            const togglePlayPause = () => {
+                if (ws.current && isReady) {
+                    if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+                        audioCtxRef.current.resume();
+                    }
+                    ws.current.playPause();
+                }
+            };
+
+            const toggleLoop = () => {
+                if (!ws.current || !wsRegions.current || !isReady) return;
+
+                if (isLoopingRef.current || loopArmedRef.current) {
+                    // If looping is active OR we are in "draw" mode, turn everything off.
+                    const region = wsRegions.current.getRegions().find(r => r.id === 'loop-region');
+                    if (region) region.remove();
+                    loopRegionRef.current = null;
+                    setIsLooping(false);
+                    if (dragCleanupRef.current) {
+                        dragCleanupRef.current();
+                        dragCleanupRef.current = null;
+                    }
+                    setLoopArmed(false);
+                } else {
+                    // Enable "draw a loop" mode.
+                    setLoopArmed(true);
+                    dragCleanupRef.current = wsRegions.current.enableDragSelection({
+                        color: 'rgba(251, 113, 133, 0.2)', // A distinct rose color for the loop
+                    });
+                }
+            };
+
+            const addNote = () => {
+                if (!isReady) return;
+                
+                // Reaction Offset: subtract 1 second, but don't go below 0
+                const rawTime = ws.current.getCurrentTime();
+                const noteTime = Math.max(0, rawTime - 1.0);
+
+                const newNote = {
+                    id: Date.now(),
+                    timestamp: noteTime,
+                    text: '',
+                    color: categories[0]?.color || '#22d3ee'
+                };
+
+                // Add note and sort by timestamp
+                setNotes(prev => [...prev, newNote].sort((a, b) => a.timestamp - b.timestamp));
+            };
+
+            const deleteNote = (id) => {
+                if (window.confirm("Are you sure you want to delete this note?")) {
+                    setNotes(prev => prev.filter(n => n.id !== id));
+                }
+            };
+
+            const updateNoteText = (id, text) => {
+                setNotes(prev => prev.map(n => n.id === id ? { ...n, text } : n));
+            };
+
+            const updateNoteColor = (id, color) => {
+                setNotes(prev => prev.map(n => n.id === id ? { ...n, color } : n));
+            };
+
+            const addCategory = () => {
+                setCategories(prev => {
+                    const newCategory = {
+                        id: `cat-${Date.now()}`,
+                        name: 'New Category',
+                        // Cycle through extra colors, then default to gray
+                        color: EXTRA_COLORS_PALETTE[prev.length - DEFAULT_CATEGORIES.length] || '#9ca3af'
+                    };
+                    return [...prev, newCategory];
+                });
+            };
+
+            const updateCategoryName = (id, name) => {
+                setCategories(prev => prev.map(cat => cat.id === id ? { ...cat, name } : cat));
+            };
+
+            const deleteCategory = (id) => {
+                if (categories.length <= 1) {
+                    alert("You must have at least one category.");
+                    return;
+                }
+                const categoryToDelete = categories.find(c => c.id === id);
+                if (!categoryToDelete) return;
+                const defaultColor = categories[0]?.color || '#22d3ee';
+                setNotes(prevNotes => prevNotes.map(note => note.color === categoryToDelete.color ? { ...note, color: defaultColor } : note));
+                setCategories(prev => prev.filter(cat => cat.id !== id));
+            };
+
+            const handleTimestampUpdate = () => {
+                if (!editingNoteId) return;
+
+                // Parse tempTimestamp (e.g., "01:30" or "90.5") into seconds
+                const parts = tempTimestamp.split(':');
+                let newTime = 0;
+
+                try {
+                    if (parts.length === 2) {
+                        const mins = parseFloat(parts[0]);
+                        const secs = parseFloat(parts[1]);
+                        if (isNaN(mins) || isNaN(secs)) throw new Error("Invalid time format");
+                        newTime = (mins * 60) + secs;
+                    } else if (parts.length === 1) {
+                        const secs = parseFloat(parts[0]);
+                        if (isNaN(secs)) throw new Error("Invalid time format");
+                        newTime = secs;
+                    } else {
+                        throw new Error("Invalid time format");
+                    }
+
+                    if (newTime < 0) newTime = 0; // Don't allow negative time
+
+                    setNotes(prev => 
+                        prev.map(n => n.id === editingNoteId ? { ...n, timestamp: newTime } : n)
+                            .sort((a, b) => a.timestamp - b.timestamp)
+                    );
+                } catch (e) {
+                    console.error("Timestamp parse error:", e.message);
+                } finally {
+                    setEditingNoteId(null);
+                }
+            };
+
+            const handleJumpToNote = (note) => {
+                if (!ws.current || !isReady) return;
+                
+                ws.current.setTime(note.timestamp);
+                
+                if (wsRegions.current) {
+                    const region = wsRegions.current.getRegions().find(r => r.id === note.id.toString());
+                    if (region && region.element) {
+                        region.element.classList.add('region-highlight');
+                        setTimeout(() => {
+                            if (region && region.element) region.element.classList.remove('region-highlight');
+                        }, 1000);
+                    }
+                }
+            };
+
+            const changePlaybackRate = (rate) => {
+                if (ws.current) {
+                    ws.current.setPlaybackRate(rate);
+                }
+                setPlaybackRate(rate);
+            };
+
+            const clearAllNotes = () => {
+                if (notes.length === 0) return;
+                if (window.confirm("Are you sure you want to delete ALL notes for this file? This action cannot be undone.")) {
+                    setNotes([]);
+                }
+            };
+
+            const handleVolumeChange = (e) => {
+                const newVolume = parseFloat(e.target.value);
+                setVolume(newVolume);
+                if (ws.current) {
+                    ws.current.setVolume(newVolume);
+                }
+            };
+
+            const handleZoomChange = (e) => {
+                const newZoom = Number(e.target.value);
+                setZoom(newZoom);
+                if (ws.current) {
+                    ws.current.zoom(newZoom);
+                }
+            };
+
+            const exportData = (format) => {
+                if (notes.length === 0) return;
+                
+                const nameBase = fileName.replace(/\.[^/.]+$/, "") || "audio_notes";
+                let content = "";
+                let type = "";
+                
+                if (format === 'json') {
+                    content = JSON.stringify(notes, null, 2);
+                    type = "application/json";
+                } else {
+                    const headers = "Timestamp,Formatted Time,Note\n";
+                    const rows = notes.map(n => {
+                        const escapedText = n.text.replace(/"/g, '""');
+                        return `${n.timestamp},"${formatTime(n.timestamp)}","${escapedText}"`;
+                    }).join("\n");
+                    content = headers + rows;
+                    type = "text/csv";
+                }
+
+                const blob = new Blob([content], { type });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${nameBase}.${format}`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            };
+
+            const exportTranscript = (format) => {
+                const syncedSentences = sentenceBoundaries
+                    .filter(s => s.start !== null && s.start !== undefined)
+                    .sort((a, b) => a.start - b.start);
+
+                if (syncedSentences.length === 0) {
+                    alert("No synchronized sentences to export. Please sync the transcript first.");
+                    return;
+                }
+
+                let content = "";
+                let type = "text/plain";
+                let filename = (fileName.replace(/\.[^/.]+$/, "") || "transcript") + "." + format;
+
+                if (format === 'srt') {
+                    type = "application/x-subrip";
+                    content = syncedSentences.map((s, i) => {
+                        const start = formatTimeForSubtitles(s.start, true);
+                        const end = formatTimeForSubtitles(s.end || s.start + 2, true);
+                        return `${i + 1}\n${start} --> ${end}\n${s.text}`;
+                    }).join("\n\n");
+                } else if (format === 'vtt') {
+                    type = "text/vtt";
+                    content = "WEBVTT\n\n" + syncedSentences.map((s) => {
+                        const start = formatTimeForSubtitles(s.start, false);
+                        const end = formatTimeForSubtitles(s.end || s.start + 2, false);
+                        return `${start} --> ${end}\n${s.text}`;
+                    }).join("\n\n");
+                }
+
+                const blob = new Blob([content], { type });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            };
+
+            const triggerImport = () => {
+                if (fileInputRef.current) fileInputRef.current.click();
+            };
+
+            const handleImport = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    try {
+                        const content = event.target.result;
+                        let importedNotes = [];
+
+                        if (file.name.toLowerCase().endsWith('.json')) {
+                            importedNotes = JSON.parse(content);
+                        } else {
+                            const lines = content.split(/\r\n|\n/);
+                            const startIndex = lines[0].toLowerCase().startsWith('timestamp') ? 1 : 0;
+                            
+                            for (let i = startIndex; i < lines.length; i++) {
+                                const line = lines[i].trim();
+                                if (!line) continue;
+                                
+                                const csvRegex = /^([^,]+),"(.*?)","((?:[^"]|"")*)"$/;
+                                const match = line.match(csvRegex);
+                                
+                                if (match) {
+                                    importedNotes.push({
+                                        id: Date.now() + i,
+                                        timestamp: parseFloat(match[1]),
+                                        text: match[3].replace(/""/g, '"'),
+                                        color: categories[0]?.color || '#22d3ee'
+                                    });
+                                }
+                            }
+                        }
+
+                        const validNotes = importedNotes.filter(n => !isNaN(n.timestamp) && n.timestamp >= 0).map(n => ({
+                            ...n,
+                            id: n.id || Date.now() + Math.random(),
+                            color: n.color || (categories[0]?.color || '#22d3ee')
+                        }));
+
+                        if (validNotes.length > 0) {
+                            setNotes(prev => [...prev, ...validNotes].sort((a, b) => a.timestamp - b.timestamp));
+                        }
+                    } catch (err) {
+                        alert("Failed to import notes.");
+                    }
+                };
+                reader.readAsText(file);
+                e.target.value = null;
+            };
+
+            const handleTranscriptLoad = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    const content = event.target.result;
+                    const lowerName = file.name.toLowerCase();
+
+                    // --- SRT / VTT Parsing ---
+                    if (lowerName.endsWith('.srt') || lowerName.endsWith('.vtt')) {
+                        const parseTime = (t) => {
+                            if (!t) return 0;
+                            t = t.trim().replace(',', '.'); // Normalize comma (SRT) to dot
+                            const parts = t.split(':');
+                            if (parts.length === 3) {
+                                return parseInt(parts[0], 10) * 3600 + parseInt(parts[1], 10) * 60 + parseFloat(parts[2]);
+                            } else if (parts.length === 2) {
+                                return parseInt(parts[0], 10) * 60 + parseFloat(parts[1]);
+                            }
+                            return 0;
+                        };
+
+                        const segments = [];
+                        let fullText = "";
+                        // Normalize line endings and split by empty lines (blocks)
+                        const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+                        const blocks = normalized.split('\n\n');
+
+                        blocks.forEach(block => {
+                            const lines = block.split('\n').map(l => l.trim()).filter(l => l);
+                            if (lines.length === 0) return;
+                            if (lines[0] === 'WEBVTT' || lines[0].startsWith('NOTE')) return; // Skip VTT header/comments
+
+                            // Find timestamp line (contains "-->")
+                            const arrowIndex = lines.findIndex(l => l.includes('-->'));
+                            if (arrowIndex !== -1) {
+                                const [startStr, endStr] = lines[arrowIndex].split('-->');
+                                const start = parseTime(startStr);
+                                const end = parseTime(endStr);
+                                
+                                // Text is everything after the timestamp line
+                                const textLines = lines.slice(arrowIndex + 1);
+                                const text = textLines.join(' ').replace(/<[^>]*>/g, '').replace(/\{.*?\}/g, ''); // Clean HTML/tags
+                                
+                                if (text) {
+                                    segments.push({ text, start, end });
+                                    fullText += text + " ";
+                                }
+                            }
+                        });
+                        setTranscript(fullText.trim());
+                        setSentenceBoundaries(segments);
+                        return;
+                    }
+
+                    // --- CSV Parsing ---
+                    if (lowerName.endsWith('.csv')) {
+                        const lines = content.split(/\r\n|\n/);
+                        const segments = [];
+                        let fullText = "";
+
+                        const parseLine = (line) => {
+                            const res = [];
+                            let cur = '';
+                            let inQ = false;
+                            for(let i=0; i<line.length; i++) {
+                                let c = line[i];
+                                if(c === '"') {
+                                    if(inQ && line[i+1] === '"') { cur += '"'; i++; }
+                                    else { inQ = !inQ; }
+                                } else if(c === ',' && !inQ) {
+                                    res.push(cur.trim()); cur = '';
+                                } else {
+                                    cur += c;
+                                }
+                            }
+                            res.push(cur.trim());
+                            return res;
+                        };
+
+                        let startIdx = 0, endIdx = 1, textIdx = 2;
+                        let hasHeader = false;
+
+                        if (lines.length > 0) {
+                            const header = parseLine(lines[0]).map(h => h.toLowerCase());
+                            if (header.includes('start') || header.includes('time') || header.includes('timestamp')) {
+                                hasHeader = true;
+                                startIdx = header.findIndex(h => h.includes('start') || h.includes('time') || h.includes('timestamp'));
+                                endIdx = header.findIndex(h => h.includes('end'));
+                                textIdx = header.findIndex(h => h.includes('text') || h.includes('content') || h.includes('transcript'));
+                            }
+                        }
+
+                        const dataLines = hasHeader ? lines.slice(1) : lines;
+                        dataLines.forEach(line => {
+                            if (!line.trim()) return;
+                            const cols = parseLine(line);
+                            // Defaults if no header: 2 cols -> [0:Start, 1:Text], 3+ cols -> [0:Start, 1:End, 2:Text]
+                            let sI = hasHeader && startIdx > -1 ? startIdx : 0;
+                            let tI = hasHeader && textIdx > -1 ? textIdx : (cols.length === 2 ? 1 : 2);
+                            let eI = hasHeader ? endIdx : (cols.length === 2 ? -1 : 1);
+
+                            const start = cols[sI] ? parseSubtitleTimestamp(cols[sI]) : null;
+                            const end = (eI > -1 && cols[eI]) ? parseSubtitleTimestamp(cols[eI]) : null;
+                            const text = cols[tI] || "";
+
+                            if (start !== null && !isNaN(start)) {
+                                segments.push({ text, start, end });
+                                fullText += text + " ";
+                            }
+                        });
+
+                        if (segments.length > 0) {
+                            setTranscript(fullText.trim());
+                            setSentenceBoundaries(segments);
+                            return;
+                        }
+                    }
+
+                    // Try parsing as JSON (for pre-synced transcripts like Whisper or AudioGen)
+                    if (file.name.toLowerCase().endsWith('.json')) {
+                        try {
+                            const data = JSON.parse(content);
+                            // 1. AudioGen/Studio Format
+                            if (data.transcript && Array.isArray(data.boundaries)) {
+                                setTranscript(data.transcript);
+                                setSentenceBoundaries(data.boundaries);
+                                return;
+                            }
+                            // 2. Whisper JSON Format
+                            if (data.text && Array.isArray(data.segments)) {
+                                setTranscript(data.text);
+                                setSentenceBoundaries(data.segments.map(seg => ({
+                                    text: seg.text.trim(),
+                                    start: seg.start,
+                                    end: seg.end
+                                })));
+                                return;
+                            }
+                        } catch (e) {}
+                    }
+
+                    // Fallback: Plain text manual syncing
+                    setTranscript(content);
+                    const chunks = splitTextIntoSentences(content);
+                    
+                    let manualBoundaries;
+                    // If audio is loaded, attempt to auto-sync by distributing text linearly across duration
+                    if (duration > 0) {
+                        const totalChars = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+                        let accumulatedTime = 0;
+                        manualBoundaries = chunks.map(chunk => {
+                            const chunkDuration = totalChars > 0 ? (chunk.length / totalChars) * duration : 0;
+                            const start = accumulatedTime;
+                            const end = accumulatedTime + chunkDuration;
+                            accumulatedTime += chunkDuration;
+                            return { text: chunk, start, end };
+                        });
+                    } else {
+                        manualBoundaries = chunks.map(chunk => ({
+                            text: chunk,
+                            start: null,
+                            end: null
+                        }));
+                    }
+                    setSentenceBoundaries(manualBoundaries);
+                };
+                reader.readAsText(file);
+                e.target.value = null;
+            };
+
+            const handleSentenceClick = (sentence, index, e) => {
+                if (e && e.shiftKey) {
+                    setEditingSentenceIndex(index);
+                    setEditSentenceStart(formatTimeForSubtitles(sentence.start, true));
+                    setEditSentenceEnd(formatTimeForSubtitles(sentence.end, true));
+                    setEditSentenceText(sentence.text);
+                    return;
+                }
+
+                const isReSync = e && e.altKey;
+                if (sentence.start !== null && sentence.start !== undefined && !isReSync) {
+                    // Case A: Sentence is synced -> Jump to timestamp
+                    if (ws.current) ws.current.setTime(sentence.start);
+                } else {
+                    // Case B: Sentence is not synced -> Manual Sync (Set to current time)
+                    if (!ws.current) return;
+                    const currentTime = ws.current.getCurrentTime();
+                    
+                    setSentenceBoundaries(prev => {
+                        const newBoundaries = [...prev];
+                        // Estimate end time based on length (approx 15 chars/sec reading speed)
+                        const estimatedDuration = Math.max(1, sentence.text.length / 15);
+                        
+                        newBoundaries[index] = {
+                            ...sentence,
+                            start: currentTime,
+                            end: currentTime + estimatedDuration
+                        };
+                        return newBoundaries;
+                    });
+                }
+            };
+
+            const saveSentenceEdit = () => {
+                if (editingSentenceIndex === null) return;
+                const start = parseSubtitleTimestamp(editSentenceStart);
+                const end = parseSubtitleTimestamp(editSentenceEnd);
+
+                setSentenceBoundaries(prev => {
+                    const newBoundaries = [...prev];
+                    newBoundaries[editingSentenceIndex] = {
+                        ...newBoundaries[editingSentenceIndex],
+                        start: start,
+                        end: end,
+                        text: editSentenceText
+                    };
+                    return newBoundaries;
+                });
+                
+                // Re-construct full transcript string from boundaries to keep them in sync
+                setSentenceBoundaries(currentBoundaries => {
+                     const newTranscript = currentBoundaries.map(s => s.text).join("");
+                     setTranscript(newTranscript);
+                     return currentBoundaries;
+                });
+
+                setEditingSentenceIndex(null);
+            };
+
+            const handleStartTranscriptEdit = () => {
+                setTempTranscriptText(transcript);
+                setIsEditingTranscript(true);
+            };
+
+            const saveTranscriptEdit = () => {
+                setTranscript(tempTranscriptText);
+                
+                // Re-parse sentences from the new text
+                const newChunks = splitTextIntoSentences(tempTranscriptText);
+                
+                // Try to preserve timestamps for unchanged sentences
+                const availableOldSentences = [...sentenceBoundaries];
+                
+                const newBoundaries = newChunks.map(chunkText => {
+                    // Find matching old sentence (trim to ignore minor whitespace diffs)
+                    const index = availableOldSentences.findIndex(s => s.text.trim() === chunkText.trim());
+                    
+                    if (index !== -1) {
+                        const match = availableOldSentences[index];
+                        availableOldSentences.splice(index, 1); // Remove so we don't match again
+                        return { text: chunkText, start: match.start, end: match.end };
+                    }
+                    
+                    // If text changed, we lose the timestamp (user can re-sync manually)
+                    return { text: chunkText, start: null, end: null };
+                });
+
+                setSentenceBoundaries(newBoundaries);
+                setIsEditingTranscript(false);
+            };
+
+            const filteredNotes = notes.filter(note => 
+                note.text.toLowerCase().includes(searchQuery.toLowerCase())
+            );
+
+            return (
+                <div className="max-w-screen-2xl mx-auto p-6">
+                    {/* Header */}
+                    <header className="mb-8 border-b border-slate-700 pb-4 flex justify-between items-end">
+                        <div>
+                            <h1 className="text-3xl font-bold text-cyan-400 neon-text tracking-tight">AudiNote<span className="text-slate-500">.studio</span></h1>
+                            <p className="text-slate-400 text-sm mt-1">Time-Coded Audio Annotation</p>
+                        </div>
+                        <div className="flex items-center space-x-3">
+                            {fileName && <span className="text-xs text-slate-500 font-mono border border-slate-700 px-2 py-1 rounded bg-slate-800">{fileName}</span>}
+                            <a 
+                                href="dashboard.html" 
+                                className="text-slate-400 hover:text-cyan-400 transition-colors p-2 text-xs font-mono uppercase tracking-widest border border-slate-700 rounded hover:border-cyan-500"
+                                title="Go to Dashboard"
+                            >Projects</a>
+                            <a 
+                                href="pdf_editor.html" 
+                                className="text-slate-400 hover:text-cyan-400 transition-colors p-2"
+                                title="Go to PDF Editor"
+                            ><svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg></a>
+                        </div>
+                    </header>
+
+                    {/* Upload State */}
+                    {!audioFile && (
+                        <div className="studio-panel rounded-xl p-12 text-center border-dashed border-2 border-slate-600 hover:border-cyan-500 transition-colors cursor-pointer relative">
+                            <input 
+                                type="file" 
+                                accept="audio/*" 
+                                onChange={handleFileUpload}
+                                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                            />
+                            <div className="text-slate-400">
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16 mx-auto mb-4 text-slate-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
+                                </svg>
+                                <p className="text-xl font-medium text-slate-200">Drop Audio File Here</p>
+                                <p className="text-sm mt-2">MP3 or WAV supported</p>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Player Interface */}
+                    {audioFile && (
+                        <div className="space-y-6 animate-fade-in">
+                            
+                            {/* Waveform Card */}
+                            <div className="studio-panel rounded-xl p-6 relative">
+                                <div id="waveform" ref={waveformRef} className="w-full"></div>
+                                <div ref={minimapRef} className="w-full mt-4 opacity-90 hover:opacity-100 transition-opacity"></div>
+                                
+                                {!isReady && (
+                                    <div className="absolute inset-0 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm z-10 rounded-xl">
+                                        <span className="text-cyan-400 font-mono animate-pulse">Generating Waveform...</span>
+                                    </div>
+                                )}
+
+                                {/* Controls */}
+                                <div className="flex items-center justify-between mt-6">
+                                    <div className="flex items-center space-x-4">
+                                        <button 
+                                            onClick={togglePlayPause}
+                                            disabled={!isReady}
+                                            className={`h-12 w-12 rounded-full flex items-center justify-center transition-all ${
+                                                isPlaying 
+                                                ? 'bg-red-500/10 text-red-400 hover:bg-red-500/20' 
+                                                : 'bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/20'
+                                            } disabled:opacity-50 disabled:cursor-not-allowed`}
+                                        >
+                                            {isPlaying ? (
+                                                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                                            ) : (
+                                                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                                            )}
+                                        </button>
+                                        
+                                        {/* Loop Button */}
+                                        <button 
+                                            onClick={toggleLoop}
+                                            disabled={!isReady}
+                                            className={`p-2 rounded-lg transition-colors ${
+                                                isLooping ? 'bg-cyan-500 text-slate-900' : 
+                                                loopArmed ? 'bg-yellow-500 text-slate-900 animate-pulse' : 
+                                                'text-slate-400 hover:text-cyan-400 hover:bg-slate-800'
+                                            } disabled:opacity-50`}
+                                            title={isLooping ? "Disable Loop" : loopArmed ? "Cancel Drawing Loop" : "Draw Loop Region"}
+                                        >
+                                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                                        </button>
+
+                                        <div className="font-mono text-xl tracking-widest text-slate-300">
+                                            {formatTime(currentTime)} <span className="text-slate-600 text-sm">/ {formatTime(duration)}</span>
+                                        </div>
+                                        
+                                        {/* Playback Speed Controls */}
+                                        <div className="flex items-center space-x-1 bg-slate-800 rounded-lg p-1 border border-slate-700 ml-4">
+                                            {[0.5, 1, 1.5, 2].map(rate => (
+                                                <button
+                                                    key={rate}
+                                                    onClick={() => changePlaybackRate(rate)}
+                                                    disabled={!isReady}
+                                                    className={`text-[10px] px-2 py-1 rounded transition-colors ${playbackRate === rate ? 'bg-cyan-500 text-slate-900 font-bold' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-700'} disabled:opacity-50`}
+                                                >
+                                                    {rate}x
+                                                </button>
+                                            ))}
+                                        </div>
+
+                                        {/* Zoom Control */}
+                                        <div className="flex items-center space-x-2 ml-4 border-l border-slate-700 pl-4 hidden sm:flex">
+                                            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v3m0 0v3m0-3h3m-3 0H7" />
+                                            </svg>
+                                            <input
+                                                type="range"
+                                                min="10" max="300" step="10"
+                                                value={zoom}
+                                                onChange={handleZoomChange}
+                                                disabled={!isReady}
+                                                className="w-20 accent-cyan-500"
+                                                title="Zoom Waveform"
+                                            />
+                                        </div>
+
+                                        {/* Volume Control */}
+                                        <div className="flex items-center space-x-2 ml-4">
+                                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                                                <path strokeLinecap="round" strokeLinejoin="round" d="M19.114 5.636a9 9 0 010 12.728M16.463 8.464a5 5 0 010 7.072M6.75 8.25l4.72-4.72a.75.75 0 011.28.53v15.88a.75.75 0 01-1.28.53l-4.72-4.72H4.51c-.88 0-1.704-.507-1.938-1.354A9.01 9.01 0 012.25 12c0-.83.112-1.633.322-2.396C2.806 8.756 3.63 8.25 4.51 8.25H6.75z" />
+                                            </svg>
+                                            <input
+                                                type="range"
+                                                min="0" max="1" step="0.05"
+                                                value={volume}
+                                                onChange={handleVolumeChange}
+                                                disabled={!isReady}
+                                                className="w-24 accent-cyan-500"
+                                            />
+                                        </div>
+                                    </div>
+
+                                    {/* The Note Button */}
+                                    <button 
+                                        onClick={addNote}
+                                        disabled={!isReady}
+                                        className="bg-cyan-500 hover:bg-cyan-400 text-slate-900 font-bold py-3 px-6 rounded-lg shadow-lg shadow-cyan-500/20 active:scale-95 transition-transform disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-2"
+                                    >
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-11a1 1 0 10-2 0v2H7a1 1 0 100 2h2v2a1 1 0 102 0v-2h2a1 1 0 100-2h-2V7z" clipRule="evenodd" /></svg>
+                                        <span>Add Note @ {formatTime(Math.max(0, currentTime - 1))}</span>
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Notes List */}
+                            <div className={`grid grid-cols-1 ${transcript ? 'lg:grid-cols-2' : ''} gap-6`}>
+                                <div className="studio-panel rounded-xl p-6 min-h-[300px]">
+                                    <h2 className="text-lg font-semibold mb-4 text-slate-300 border-b border-slate-700 pb-2 flex justify-between items-center">
+                                        <span>Session Notes</span>
+                                        <div className="flex items-center space-x-3 sm:space-x-4">
+                                            <input 
+                                                type="text" 
+                                                placeholder="Search notes..." 
+                                                value={searchQuery}
+                                                onChange={(e) => setSearchQuery(e.target.value)}
+                                                className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-cyan-500 placeholder-slate-600 w-24 sm:w-40 transition-colors"
+                                            />
+                                            <input 
+                                                type="file" 
+                                                ref={fileInputRef} 
+                                                onChange={handleImport} 
+                                                accept=".json,.csv" 
+                                                style={{display: 'none'}} 
+                                            />
+                                            <input 
+                                                type="file" 
+                                                id="transcript-upload"
+                                                onChange={handleTranscriptLoad} 
+                                                accept=".txt,.md,.json,.srt,.vtt,.csv" 
+                                                style={{display: 'none'}} 
+                                            />
+                                            <span className="text-xs font-normal text-slate-500 hidden sm:inline">Auto-saved</span>
+                                            <div className="flex space-x-2">
+                                                <button onClick={() => setShowCategoryManager(true)} className="text-xs bg-slate-700 hover:bg-slate-600 text-cyan-400 px-2 py-1 rounded transition-colors">Categories</button>
+                                                <button onClick={triggerImport} className="text-xs bg-slate-700 hover:bg-slate-600 text-cyan-400 px-2 py-1 rounded transition-colors">Import</button>
+                                                <button onClick={() => exportData('csv')} disabled={notes.length === 0} className="text-xs bg-slate-700 hover:bg-slate-600 text-cyan-400 px-2 py-1 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed">CSV</button>
+                                                <button onClick={() => exportData('json')} disabled={notes.length === 0} className="text-xs bg-slate-700 hover:bg-slate-600 text-cyan-400 px-2 py-1 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed">JSON</button>
+                                                <button onClick={clearAllNotes} disabled={notes.length === 0} className="text-xs bg-slate-700 hover:bg-red-600 text-red-400 hover:text-white px-2 py-1 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed">Clear</button>
+                                            </div>
+                                        </div>
+                                    </h2>
+                                    
+                                    {notes.length === 0 ? (
+                                        <div className="text-center text-slate-600 py-10 italic select-none">
+                                            No notes yet. Click the button to capture a moment.
+                                        </div>
+                                    ) : filteredNotes.length === 0 ? (
+                                        <div className="text-center text-slate-600 py-10 italic select-none">
+                                            No notes match your search.
+                                        </div>
+                                    ) : (
+                                        <div className="space-y-3 max-h-[500px] overflow-y-auto pr-2">
+                                            {filteredNotes.map((note, index) => (
+                                                <div key={note.id} className="group flex items-start space-x-4 bg-slate-900/50 p-3 rounded-r-md border-l-4 transition-colors hover:bg-slate-800/50" style={{borderLeftColor: note.color || (categories[0]?.color || '#22d3ee')}}>
+                                                    <div className="w-20 flex-shrink-0 mt-1">
+                                                        {editingNoteId === note.id ? (
+                                                            <input
+                                                                type="text"
+                                                                value={tempTimestamp}
+                                                                onChange={(e) => setTempTimestamp(e.target.value)}
+                                                                onBlur={handleTimestampUpdate}
+                                                                onKeyDown={(e) => {
+                                                                    if (e.key === 'Enter') {
+                                                                        e.preventDefault();
+                                                                        handleTimestampUpdate();
+                                                                    }
+                                                                    if (e.key === 'Escape') setEditingNoteId(null);
+                                                                }}
+                                                                autoFocus
+                                                                className="font-mono bg-slate-700 px-2 py-1 rounded text-xs w-full text-center"
+                                                                style={{color: note.color || (categories[0]?.color || '#22d3ee')}}
+                                                            />
+                                                        ) : (
+                                                            <button 
+                                                                onClick={() => handleJumpToNote(note)}
+                                                                onDoubleClick={() => { setEditingNoteId(note.id); setTempTimestamp(formatTime(note.timestamp)); }}
+                                                                className="font-mono bg-slate-800 px-2 py-1 rounded hover:opacity-80 transition-opacity text-xs w-full"
+                                                                style={{color: note.color || (categories[0]?.color || '#22d3ee')}}
+                                                                title="Jump to time (double-click to edit)"
+                                                            >
+                                                                {formatTime(note.timestamp)}
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                    
+                                                    <div className="flex-1">
+                                                        <textarea 
+                                                            value={note.text}
+                                                            onChange={(e) => updateNoteText(note.id, e.target.value)}
+                                                            placeholder="Type note here..."
+                                                            className="w-full bg-transparent border-0 focus:ring-0 p-0 text-slate-200 placeholder-slate-600 resize-none h-auto min-h-[1.5rem]"
+                                                            rows={1}
+                                                            onInput={(e) => {
+                                                                e.target.style.height = 'auto';
+                                                                e.target.style.height = e.target.scrollHeight + 'px';
+                                                            }}
+                                                        />
+                                                        <div className="relative category-dropdown-container mt-2">
+                                                            <button 
+                                                                onClick={() => setOpenDropdownId(openDropdownId === note.id ? null : note.id)}
+                                                                className="flex items-center space-x-2 text-xs text-slate-400 hover:text-white transition-colors"
+                                                            >
+                                                                <div className="w-3 h-3 rounded-full" style={{backgroundColor: note.color}}></div>
+                                                                <span>{categories.find(c => c.color === note.color)?.name || 'Uncategorized'}</span>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                                                            </button>
+                                                            {openDropdownId === note.id && (
+                                                                <div className="absolute z-20 top-full mt-1 bg-slate-900 border border-slate-700 rounded-md shadow-lg p-1 w-40">
+                                                                    {categories.map(cat => (
+                                                                        <button
+                                                                            key={cat.id}
+                                                                            onClick={() => {
+                                                                                updateNoteColor(note.id, cat.color);
+                                                                                setOpenDropdownId(null);
+                                                                            }}
+                                                                            className="w-full flex items-center space-x-2 text-left px-2 py-1 rounded hover:bg-slate-700 text-slate-300 text-sm"
+                                                                        >
+                                                                            <div className="w-3 h-3 rounded-full flex-shrink-0" style={{backgroundColor: cat.color}}></div>
+                                                                            <span>{cat.name}</span>
+                                                                        </button>
+                                                                    ))}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    </div>
+
+                                                    <button 
+                                                        onClick={() => deleteNote(note.id)}
+                                                        className="text-slate-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity p-1"
+                                                        title="Delete note"
+                                                    >
+                                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" /></svg>
+                                                    </button>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="studio-panel rounded-xl p-6 min-h-[300px] max-h-[600px] overflow-y-auto flex flex-col">
+                                    <h2 className="text-lg font-semibold mb-4 text-slate-300 border-b border-slate-700 pb-2 flex justify-between items-center">
+                                        <span>
+                                            Transcript {isEditingTranscript && <span className="text-xs text-yellow-500 ml-2 font-normal">(Editing Mode)</span>}
+                                        </span>
+                                        <div className="flex space-x-2">
+                                            {transcript && (
+                                                <button 
+                                                    onClick={() => setForceScrollTrigger(prev => prev + 1)}
+                                                    className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs text-slate-400 hover:text-cyan-400 hover:border-cyan-500 transition-colors mr-2 flex items-center"
+                                                    title="Auto-scroll to current sentence"
+                                                >
+                                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                                                </button>
+                                            )}
+                                            {transcript && (
+                                                <input 
+                                                    type="text" 
+                                                    placeholder="Find text..." 
+                                                    value={transcriptSearchQuery}
+                                                    onChange={(e) => setTranscriptSearchQuery(e.target.value)}
+                                                    className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-cyan-500 placeholder-slate-600 w-24 sm:w-32 transition-colors mr-2"
+                                                />
+                                            )}
+                                            
+                                            {isEditingTranscript ? (
+                                                 <>
+                                                    <button onClick={() => setIsEditingTranscript(false)} className="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-2 py-1 rounded transition-colors">Cancel</button>
+                                                    <button onClick={saveTranscriptEdit} className="text-xs bg-cyan-600 hover:bg-cyan-500 text-white font-bold px-3 py-1 rounded transition-colors shadow-lg shadow-cyan-500/20">Save Text</button>
+                                                 </>
+                                            ) : (
+                                                <div className="flex space-x-1">
+                                                    <label htmlFor="transcript-upload" className="text-xs bg-slate-700 hover:bg-slate-600 text-cyan-400 px-2 py-1 rounded transition-colors cursor-pointer mr-1" title="Import Transcript (TXT, JSON, SRT, VTT)">
+                                                        {transcript ? 'Import' : 'Load Text'}
+                                                    </label>
+                                                    {transcript && (
+                                                        <>
+                                                            <button onClick={handleStartTranscriptEdit} className="text-xs bg-slate-700 hover:bg-slate-600 text-cyan-400 px-2 py-1 rounded transition-colors" title="Edit Full Text">Edit</button>
+                                                            <button onClick={() => exportTranscript('srt')} className="text-xs bg-slate-700 hover:bg-slate-600 text-cyan-400 px-2 py-1 rounded transition-colors">SRT</button>
+                                                            <button onClick={() => exportTranscript('vtt')} className="text-xs bg-slate-700 hover:bg-slate-600 text-cyan-400 px-2 py-1 rounded transition-colors">VTT</button>
+                                                        </>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </div>
+                                    </h2>
+                                    {isEditingTranscript ? (
+                                        <textarea
+                                            value={tempTranscriptText}
+                                            onChange={(e) => setTempTranscriptText(e.target.value)}
+                                            className="w-full h-full min-h-[400px] bg-slate-900 border border-slate-700 rounded p-4 text-base font-serif text-slate-200 focus:outline-none focus:border-cyan-500 resize-none"
+                                            placeholder="Edit transcript text..."
+                                        />
+                                    ) : (
+                                        transcript ? (
+                                            <TranscriptViewer text={transcript} sentences={sentenceBoundaries} currentStart={currentSentenceStart} currentTime={currentTime} currentWordStart={currentWordStart} onSentenceClick={handleSentenceClick} searchQuery={transcriptSearchQuery} forceScroll={forceScrollTrigger} />
+                                        ) : (
+                                            <div className="flex-1 flex flex-col items-center justify-center text-slate-600 italic select-none">
+                                                <p>No transcript loaded.</p>
+                                                <p className="text-xs mt-2">Upload a text file to follow along.</p>
+                                            </div>
+                                        )
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {showCategoryManager && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+                            <div className="studio-panel rounded-xl p-6 w-full max-w-md">
+                                <h3 className="text-lg font-bold text-white mb-4">Manage Categories</h3>
+                                <div className="space-y-2 max-h-64 overflow-y-auto mb-4 pr-2">
+                                    {categories.map(cat => (
+                                        <div key={cat.id} className="flex items-center space-x-2">
+                                            <div className="w-5 h-5 rounded-full flex-shrink-0" style={{ backgroundColor: cat.color }}></div>
+                                            <input
+                                                type="text"
+                                                value={cat.name}
+                                                onChange={(e) => updateCategoryName(cat.id, e.target.value)}
+                                                className="flex-1 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-slate-200 focus:outline-none focus:border-cyan-500"
+                                            />
+                                            <button onClick={() => deleteCategory(cat.id)} className="text-slate-500 hover:text-red-400 p-1 disabled:opacity-50 disabled:cursor-not-allowed" disabled={categories.length <= 1}>
+                                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" /></svg>
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                                <div className="flex justify-between items-center mt-4">
+                                    <button onClick={addCategory} className="text-xs bg-slate-700 hover:bg-slate-600 text-cyan-400 px-3 py-1 rounded">Add New Category</button>
+                                    <button onClick={() => setShowCategoryManager(false)} className="text-sm bg-cyan-600 hover:bg-cyan-500 text-white font-bold px-4 py-1 rounded">Done</button>
+                                </div>
+                                </div>
+                        </div>
+                    )}
+
+                    {editingSentenceIndex !== null && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+                            <div className="studio-panel rounded-xl p-6 w-full max-w-md">
+                                <h3 className="text-lg font-bold text-white mb-4">Edit Timestamps</h3>
+                                <p className="text-xs text-slate-400 mb-4 line-clamp-3 italic">
+                                    "{sentenceBoundaries[editingSentenceIndex]?.text}"
+                                </p>
+                                <div className="space-y-3">
+                                    <div>
+                                        <label className="block text-xs text-slate-500 mb-1">Start Time (HH:MM:SS,ms)</label>
+                                        <input 
+                                            type="text" 
+                                            value={editSentenceStart}
+                                            onChange={(e) => setEditSentenceStart(e.target.value)}
+                                            className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-cyan-400 font-mono focus:border-cyan-500 outline-none"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs text-slate-500 mb-1">End Time (HH:MM:SS,ms)</label>
+                                        <input 
+                                            type="text" 
+                                            value={editSentenceEnd}
+                                            onChange={(e) => setEditSentenceEnd(e.target.value)}
+                                            className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-cyan-400 font-mono focus:border-cyan-500 outline-none"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs text-slate-500 mb-1">Text Content</label>
+                                        <textarea 
+                                            value={editSentenceText}
+                                            onChange={(e) => setEditSentenceText(e.target.value)}
+                                            rows={3}
+                                            className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-slate-200 focus:border-cyan-500 outline-none resize-none"
+                                        />
+                                    </div>
+                                </div>
+                                <div className="flex justify-end items-center mt-6 space-x-2">
+                                    <button onClick={() => setEditingSentenceIndex(null)} className="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-3 py-2 rounded">Cancel</button>
+                                    <button onClick={saveSentenceEdit} className="text-xs bg-cyan-600 hover:bg-cyan-500 text-white font-bold px-4 py-2 rounded">Save</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<AudioNotetaker />);
+    </script>
+</body>
+</html>

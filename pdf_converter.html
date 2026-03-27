@@ -1,0 +1,973 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Studio PDF to Speech</title>
+    <!-- Allow unsafe-eval for Babel standalone -->
+    <meta http-equiv="Content-Security-Policy" content="script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://cdn.tailwindcss.com https://cdnjs.cloudflare.com; worker-src 'self' blob: https://cdnjs.cloudflare.com;">
+    
+    <!-- Dependencies -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- PDF.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+    <!-- Custom Styles (Matching existing Studio theme) -->
+    <style>
+        body {
+            background-color: #0f172a; /* Slate 900 */
+            color: #e2e8f0; /* Slate 200 */
+        }
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #1e293b;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #475569;
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #64748b;
+        }
+        .studio-panel {
+            background-color: #1e293b; /* Slate 800 */
+            border: 1px solid #334155; /* Slate 700 */
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5);
+        }
+        .neon-text {
+            text-shadow: 0 0 10px rgba(34, 211, 238, 0.5);
+        }
+        .selection-highlight::selection {
+            background-color: #22d3ee; /* Cyan */
+            color: #0f172a;
+        }
+        .highlighted-sentence {
+            background-color: rgba(34, 211, 238, 0.2);
+            transition: background-color 0.3s ease-in-out;
+            border-radius: 4px;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-fade-in {
+            animation: fadeIn 0.3s ease-out forwards;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // Initialize PDF.js worker
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        const PdfToSpeech = () => {
+            // --- State: Configuration ---
+            const [apiKey, setApiKey] = useState(() => sessionStorage.getItem('elevenlabs_api_key') || '');
+            const [showSettings, setShowSettings] = useState(false);
+            
+            // --- State: PDF & Text ---
+            const [pdfDoc, setPdfDoc] = useState(null);
+            const [currentPage, setCurrentPage] = useState(1);
+            const [totalPages, setTotalPages] = useState(0);
+            const [pageText, setPageText] = useState("");
+            const [fileName, setFileName] = useState("");
+            const [selectedText, setSelectedText] = useState("");
+
+            const [isEditingText, setIsEditingText] = useState(false);
+            const [editableText, setEditableText] = useState("");
+
+            // --- State: Audio & API ---
+            const [voices, setVoices] = useState([]);
+            const [models, setModels] = useState([]);
+            const [selectedModel, setSelectedModel] = useState('eleven_multilingual_v2'); // Default to a known good model
+            const [selectedVoice, setSelectedVoice] = useState("");
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [audioUrl, setAudioUrl] = useState(null);
+            const [errorMsg, setErrorMsg] = useState("");
+            const [successMsg, setSuccessMsg] = useState("");
+            const [keyUsedForFetch, setKeyUsedForFetch] = useState('');
+            const [history, setHistory] = useState([]);
+            const [showHistory, setShowHistory] = useState(false);
+            const [isExporting, setIsExporting] = useState(false);
+            
+            // --- State: Streaming & Highlighting ---
+            const [wordBoundaries, setWordBoundaries] = useState([]);
+            const [sentenceBoundaries, setSentenceBoundaries] = useState([]);
+            const [currentSentenceStart, setCurrentSentenceStart] = useState(-1);
+            const [isStreaming, setIsStreaming] = useState(false);
+
+            // --- Refs ---
+            const fileInputRef = useRef(null);
+            const audioPlayerRef = useRef(null);
+            const wsRef = useRef(null);
+            const fullAudioBuffer = useRef([]);
+
+            // --- Effects ---
+            // --- Listen for audio sent from App B ---
+
+            useEffect(() => {
+                console.log("[Converter] Component mounted. Checking for pending data...");
+                // 1. Check for pending text from the editor on initial load via sessionStorage
+                const pendingTextJSON = sessionStorage.getItem('studio_pending_text_load');
+                if (pendingTextJSON) {
+                    try {
+                        const payload = JSON.parse(pendingTextJSON);
+                        console.log("[Converter] Found pending text in sessionStorage. Loading...", payload);
+                        setPageText(payload.text);
+                        setEditableText(payload.text);
+                        setFileName(payload.fileName);
+                        setPdfDoc(null);
+                        setTotalPages(1);
+                        setCurrentPage(1);
+                        setIsEditingText(true);
+                        setSuccessMsg("Text successfully received from Editor!");
+                        setTimeout(() => setSuccessMsg(""), 3000);
+                    } catch (e) { console.error("Failed to parse pending text", e); }
+                    sessionStorage.removeItem('studio_pending_text_load'); // Clear after loading
+                }
+
+                // 2. Listen for live updates from an already-open editor tab
+                const bcText = new BroadcastChannel('studio_text_bridge');
+                bcText.onmessage = (event) => {
+                    console.log("[Converter] Received broadcast:", event.data);
+                    if (event.data && event.data.type === 'LOAD_TEXT') {
+                        console.log("[Converter] Loading text into editor state...");
+                        setPageText(event.data.text);
+                        setEditableText(event.data.text); // FIX: Sync editable text state so the textarea isn't empty
+                        setFileName(event.data.fileName);
+                        setPdfDoc(null); // Clear raw PDF doc if it exists
+                        setTotalPages(1); // Set to 1 to prevent "Page 0/0"
+                        setCurrentPage(1);
+                        setIsEditingText(true); // Open in edit mode so they can see/modify immediately
+                        setSuccessMsg("Text successfully received from Editor!");
+                        setTimeout(() => setSuccessMsg(""), 3000);
+                    }
+                };
+
+                return () => {
+                    bcText.close();
+                };
+            }, []);
+
+            // --- Persistence ---
+            useEffect(() => {
+                // Save history metadata to localStorage for the Dashboard
+                // We exclude the blob URL because it is invalid across sessions
+                const metadata = history.map(item => ({
+                    ...item,
+                    url: null 
+                }));
+                if (metadata.length > 0) {
+                    localStorage.setItem('pdf_gen_history', JSON.stringify(metadata));
+                }
+            }, [history]);
+
+            useEffect(() => {
+                if (apiKey) {
+                    sessionStorage.setItem('elevenlabs_api_key', apiKey);
+                }
+            }, [apiKey]);
+
+            useEffect(() => {
+                const fetchModels = async () => {
+                    if (!apiKey) return;
+                    try {
+                        const response = await fetch('https://api.elevenlabs.io/v1/models', {
+                            headers: { 'xi-api-key': apiKey }
+                        });
+                        if (!response.ok) throw new Error('Failed to fetch models.');
+                        const data = await response.json();
+                        // Filter for models that can be used with text-to-speech
+                        const ttsModels = data.filter(m => m.can_be_finetuned === false && m.name.includes('Eleven'));
+                        setModels(ttsModels);
+                        // Set a default if the current one isn't in the list
+                        if (ttsModels.length > 0 && !ttsModels.some(m => m.model_id === selectedModel)) {
+                            const defaultModel = ttsModels.find(m => m.model_id.includes('multilingual_v2')) || ttsModels[0];
+                            setSelectedModel(defaultModel.model_id);
+                        }
+                    } catch (err) {
+                        console.error("Model Fetch Error:", err);
+                        // Don't show a blocking error, as the default might still work.
+                    }
+                };
+                fetchModels();
+            }, [apiKey]);
+
+            useEffect(() => {
+                // When streaming is done and we have word boundaries, process them into sentences.
+                if (!isStreaming && wordBoundaries.length > 0 && sentenceBoundaries.length === 0) {
+                    const sentences = [];
+                    let currentSentenceText = '';
+                    let sentenceStartTime = -1;
+                    let wordsInSentence = [];
+
+                    wordBoundaries.forEach((word, i) => {
+                        if (sentenceStartTime === -1) {
+                            sentenceStartTime = word.start;
+                        }
+                        currentSentenceText += word.word + ' ';
+                        wordsInSentence.push(word);
+
+                        const isEndOfSentence = /[.?!]/.test(word.word);
+                        const isLastWord = i === wordBoundaries.length - 1;
+
+                        if ((isEndOfSentence || isLastWord) && currentSentenceText.trim()) {
+                            sentences.push({
+                                text: currentSentenceText.trim(),
+                                start: sentenceStartTime,
+                                end: word.end,
+                                words: wordsInSentence,
+                            });
+                            currentSentenceText = '';
+                            sentenceStartTime = -1;
+                            wordsInSentence = [];
+                        }
+                    });
+                    setSentenceBoundaries(sentences);
+                }
+            }, [isStreaming, wordBoundaries, sentenceBoundaries]);
+
+            // --- Keyboard Shortcuts ---
+            useEffect(() => {
+                const handleKeyDown = (e) => {
+                    if (e.key === 'Escape') {
+                        setSelectedText("");
+                        if (window.getSelection) window.getSelection().removeAllRanges();
+                        setIsEditingText(false);
+                    }
+                };
+                window.addEventListener('keydown', handleKeyDown);
+                return () => window.removeEventListener('keydown', handleKeyDown);
+            }, []);
+
+            // --- PDF Handlers ---
+            const handleFileUpload = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                setFileName(file.name);
+                setErrorMsg("");
+                setIsEditingText(false);
+                
+                if (file.name.toLowerCase().endsWith('.pdf') || file.type === 'application/pdf') {
+                    setPageText("Loading PDF...");
+                    try {
+                        const arrayBuffer = await file.arrayBuffer();
+                        const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+                        const doc = await loadingTask.promise;
+                        
+                        setPdfDoc(doc);
+                        setTotalPages(doc.numPages);
+                        setCurrentPage(1);
+                        extractPageText(doc, 1);
+                    } catch (err) {
+                        console.error(err);
+                        setErrorMsg("Failed to parse PDF. Please ensure it is a valid file.");
+                        setPageText("");
+                    }
+                } else if (file.name.toLowerCase().endsWith('.txt') || file.type === 'text/plain') {
+                    setPageText("Loading Text...");
+                    const reader = new FileReader();
+                    reader.onload = (event) => {
+                        setPageText(event.target.result);
+                        setPdfDoc(null);
+                        setTotalPages(1);
+                        setCurrentPage(1);
+                        setIsEditingText(true);
+                    };
+                    reader.readAsText(file);
+                } else {
+                    setErrorMsg("Unsupported file format. Please upload a PDF or TXT file.");
+                }
+            };
+
+            const extractPageText = async (doc, pageNum) => {
+                try {
+                    const page = await doc.getPage(pageNum);
+                    const textContent = await page.getTextContent();
+                    // Simple extraction: join strings with space. 
+                    // PDF.js returns items with transform info, simplified here for reading.
+                    const text = textContent.items.map(item => item.str).join(' ');
+                    setPageText(text || "No text found on this page.");
+                    setSelectedText(""); // Reset selection on page change
+                    setIsEditingText(false); // Exit edit mode on page change
+                } catch (err) {
+                    setErrorMsg(`Error extracting text from page ${pageNum}`);
+                }
+            };
+
+            const changePage = (delta) => {
+                if (!pdfDoc) return;
+                const newPage = currentPage + delta;
+                if (newPage >= 1 && newPage <= totalPages) {
+                    setCurrentPage(newPage);
+                    extractPageText(pdfDoc, newPage);
+                }
+            };
+
+            const handleTextSelection = () => {
+                const selection = window.getSelection();
+                const text = selection.toString().trim();
+                if (text) {
+                    setSelectedText(text);
+                }
+            };
+
+            const handleSettingsClose = () => {
+                setShowSettings(false);
+                if (apiKey && apiKey !== keyUsedForFetch) {
+                    fetchVoices();
+                }
+            };
+
+            const handleEnterEditMode = () => {
+                setEditableText(pageText);
+                setIsEditingText(true);
+            };
+
+            const handleSaveChanges = () => {
+                setPageText(editableText);
+                setIsEditingText(false);
+                setSelectedText(""); // Clear selection as the underlying text has changed
+            };
+
+            const handleCancelEdit = () => {
+                setIsEditingText(false);
+                // No need to reset editableText, it will be overwritten on next edit
+            };
+
+            const handleCopyText = () => {
+                if (!pageText) return;
+                navigator.clipboard.writeText(pageText).then(() => {
+                    setSuccessMsg("Text copied to clipboard!");
+                    setTimeout(() => setSuccessMsg(""), 2000);
+                }).catch(err => {
+                    console.error("Failed to copy text:", err);
+                    setErrorMsg("Could not copy text to clipboard.");
+                    setTimeout(() => setErrorMsg(""), 3000);
+                });
+            };
+
+            const handleTimeUpdate = (e) => {
+                if (!sentenceBoundaries.length) return;
+                const currentTime = e.target.currentTime;
+                const currentSentence = sentenceBoundaries.find(
+                    (s) => currentTime >= s.start && currentTime < s.end
+                );
+                
+                if (currentSentence) {
+                    if (currentSentence.start !== currentSentenceStart) {
+                        setCurrentSentenceStart(currentSentence.start);
+                    }
+                } else if (currentSentenceStart !== -1) {
+                    setCurrentSentenceStart(-1);
+                }
+            };
+
+            const handleSendToNoteTaker = async () => {
+                if (!audioUrl) return;
+                setSuccessMsg("Sending to AudiNote...");
+
+                try {
+                    // 1. Get the blob from the current audioUrl
+                    const response = await fetch(audioUrl);
+                    const blob = await response.blob();
+                    
+                    const bc = new BroadcastChannel('studio_audio_bridge');
+                    
+                    // 2. Open Notetaker in a new tab/window (reusing name to avoid duplicates)
+                    const targetWindow = window.open('notetaker.html', 'audi_notetaker_tab');
+                    
+                    // 3. Send the audio data repeatedly for a few seconds to ensure the new tab catches it upon load
+                    const payload = { 
+                        type: 'LOAD_AUDIO_WITH_TRANSCRIPT', 
+                        blob: blob, 
+                        name: `generated_${Date.now()}.mp3`,
+                        transcript: pageText,
+                        boundaries: sentenceBoundaries
+                    };
+                    
+                    // Send immediately (if tab is already open)
+                    bc.postMessage(payload);
+                    
+                    // Send a few retries for when the tab is loading
+                    let attempts = 0;
+                    const interval = setInterval(() => {
+                        bc.postMessage(payload);
+                        attempts++;
+                        if (attempts > 4) clearInterval(interval);
+                    }, 500); // Retry every 500ms
+
+                } catch (err) {
+                    console.error("Failed to send audio:", err);
+                    setErrorMsg("Failed to send audio to Studio.");
+                }
+            };
+
+            // --- ElevenLabs Handlers ---
+            const fetchVoices = async () => {
+                if (!apiKey) {
+                    setErrorMsg("Please enter your API Key in settings first.");
+                    setShowSettings(true);
+                    return;
+                }
+                
+                setIsProcessing(true);
+                setErrorMsg("");
+                
+                try {
+                    const response = await fetch('https://api.elevenlabs.io/v1/voices', {
+                        headers: { 'xi-api-key': apiKey }
+                    });
+                    
+                    if (!response.ok) {
+                        const errorText = await response.text();
+                        let errorDetail = `Status: ${response.status}`;
+                        try {
+                            const errorJson = JSON.parse(errorText);
+                            errorDetail = errorJson.detail?.message || errorDetail;
+                        } catch (e) {}
+                        throw new Error(`Failed to fetch voices. ${errorDetail}`);
+                    }
+                    
+                    const data = await response.json();
+                    setVoices(data.voices);
+                    if (data.voices.length > 0 && !selectedVoice) {
+                        setSelectedVoice(data.voices[0].voice_id);
+                    }
+                    setKeyUsedForFetch(apiKey);
+                    setSuccessMsg("Voices loaded successfully!");
+                    setTimeout(() => setSuccessMsg(""), 3000);
+                } catch (err) {
+                    console.error("Voice Fetch Error:", err);
+                    setKeyUsedForFetch('');
+                    setErrorMsg(err.message);
+                } finally {
+                    setIsProcessing(false);
+                }
+            };
+
+            const streamAndPlayAudio = async () => {
+                const textToConvert = selectedText || pageText;
+                
+                if (!textToConvert) {
+                    setErrorMsg("No text to convert.");
+                    return;
+                }
+                if (!apiKey) {
+                    setErrorMsg("API Key missing.");
+                    setShowSettings(true);
+                    return;
+                }
+                if (!selectedVoice) {
+                    setErrorMsg("Please select a voice first (Fetch Voices).");
+                    return;
+                }
+
+                setIsProcessing(true);
+                setErrorMsg("");
+                setWordBoundaries([]);
+                setSentenceBoundaries([]);
+                setCurrentSentenceStart(-1);
+                fullAudioBuffer.current = [];
+                if (wsRef.current) wsRef.current.close();
+
+                // 1. Setup MediaSource for live playback
+                const mediaSource = new MediaSource();
+                setAudioUrl(null);
+                setAudioUrl(URL.createObjectURL(mediaSource));
+
+                mediaSource.addEventListener('sourceopen', () => {
+                    try {
+                        const sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+                        const processQueue = () => {
+                            if (!sourceBuffer.updating && fullAudioBuffer.current.length > 0) {
+                                sourceBuffer.appendBuffer(fullAudioBuffer.current.shift());
+                            }
+                            if (!isStreaming && fullAudioBuffer.current.length === 0 && mediaSource.readyState === "open") {
+                                mediaSource.endOfStream();
+                            }
+                        };
+                        sourceBuffer.addEventListener('updateend', processQueue);
+                    } catch (e) {
+                        console.error("MediaSource error:", e);
+                        setErrorMsg("Browser does not support audio streaming for this format.");
+                    }
+                });
+
+                // 2. Setup WebSocket
+                const websocket = new WebSocket(`wss://api.elevenlabs.io/v1/text-to-speech/${selectedVoice}/stream-input?model_id=${selectedModel}&output_format=mp3_44100_128`);
+                wsRef.current = websocket;
+
+                websocket.onopen = () => {
+                    setIsStreaming(true);
+                    websocket.send(JSON.stringify({ text: " ", voice_settings: { stability: 0.5, similarity_boost: 0.5 }, xi_api_key: apiKey }));
+                    websocket.send(JSON.stringify({ text: textToConvert, try_trigger_generation: true }));
+                    websocket.send(JSON.stringify({ text: "" })); // End of stream
+                };
+
+                websocket.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    if (data.audio) {
+                        const audioChunk = atob(data.audio);
+                        const buffer = new Uint8Array(audioChunk.length);
+                        for (let i = 0; i < audioChunk.length; i++) buffer[i] = audioChunk.charCodeAt(i);
+                        fullAudioBuffer.current.push(buffer);
+                    }
+                    if (data.alignment) {
+                        const { chars, char_start_times_ms } = data.alignment;
+                        if (!chars) return;
+                        const newWords = [];
+                        let currentWord = '', wordStartTime = 0;
+                        chars.forEach((char, i) => {
+                            if (currentWord === '') wordStartTime = char_start_times_ms[i];
+                            if (char !== ' ') {
+                                currentWord += char;
+                            } else if (currentWord) {
+                                newWords.push({ word: currentWord, start: wordStartTime / 1000, end: char_start_times_ms[i] / 1000 });
+                                currentWord = '';
+                            }
+                        });
+                        if (currentWord) newWords.push({ word: currentWord, start: wordStartTime / 1000, end: (char_start_times_ms[char_start_times_ms.length - 1] + 50) / 1000 });
+                        setWordBoundaries(prev => [...prev, ...newWords]);
+                    }
+                    if (data.isFinal) {
+                        // This is the final message.
+                    }
+                };
+
+                websocket.onclose = () => {
+                    setIsStreaming(false);
+                    setIsProcessing(false);
+                    setSuccessMsg("Audio stream complete!");
+                    setTimeout(() => setSuccessMsg(""), 3000);
+
+                    // Create a permanent blob for history and seeking
+                    const finalBlob = new Blob(fullAudioBuffer.current, { type: 'audio/mpeg' });
+                    const permanentUrl = URL.createObjectURL(finalBlob);
+                    setAudioUrl(permanentUrl); // Switch to the full, seekable audio file
+
+                    const newItem = {
+                        id: Date.now(),
+                        text: textToConvert,
+                        url: permanentUrl,
+                        voiceName: voices.find(v => v.voice_id === selectedVoice)?.name || 'Voice',
+                        timestamp: new Date().toLocaleTimeString()
+                    };
+                    setHistory(prev => [newItem, ...prev]);
+                };
+
+                websocket.onerror = (err) => {
+                    console.error("WebSocket Error:", err);
+                    setErrorMsg("Streaming failed. Check your connection or API key.");
+                    setIsProcessing(false);
+                    setIsStreaming(false);
+                };
+            };
+
+            const handleBulkExport = async () => {
+                if (history.length === 0 || isExporting) return;
+
+                setIsExporting(true);
+                setSuccessMsg("Preparing export... This may take a moment.");
+
+                try {
+                    const zip = new JSZip();
+
+                    // 1. Create CSV metadata
+                    const escapeCsvField = (field) => {
+                        const stringField = String(field || '');
+                        // If field contains comma, newline, or quote, wrap in quotes and double up existing quotes
+                        if (stringField.includes(',') || stringField.includes('\n') || stringField.includes('"')) {
+                            return `"${stringField.replace(/"/g, '""')}"`;
+                        }
+                        return stringField;
+                    };
+
+                    const csvHeader = "ID,Timestamp,Voice,Text\r\n";
+                    const csvRows = history.map(item => 
+                        [item.id, item.timestamp, item.voiceName, item.text].map(escapeCsvField).join(',')
+                    ).join('\r\n');
+                    
+                    zip.file("metadata.csv", csvHeader + csvRows);
+
+                    // 2. Fetch audio blobs and add to zip
+                    const audioFolder = zip.folder("audio");
+                    await Promise.all(history.map(async (item) => {
+                        try {
+                            const response = await fetch(item.url);
+                            const audioBlob = await response.blob();
+                            audioFolder.file(`${item.id}.mp3`, audioBlob);
+                        } catch (err) {
+                            console.error(`Failed to fetch audio for history item ${item.id}`, err);
+                        }
+                    }));
+
+                    // 3. Generate and download zip
+                    const zipBlob = await zip.generateAsync({ type: 'blob' });
+                    const downloadUrl = URL.createObjectURL(zipBlob);
+                    const a = document.createElement('a');
+                    a.href = downloadUrl;
+                    a.download = `audiogen_export_${Date.now()}.zip`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(downloadUrl);
+
+                    setSuccessMsg("Export complete! Check your downloads.");
+                } catch (err) {
+                    console.error("Bulk export failed:", err);
+                    setErrorMsg("Bulk export failed. See console for details.");
+                } finally {
+                    setIsExporting(false);
+                    setTimeout(() => { setSuccessMsg(""); setErrorMsg(""); }, 5000);
+                }
+            };
+
+            const handleClearHistory = () => {
+                if (history.length === 0) return;
+                if (window.confirm("Are you sure you want to clear all history? This cannot be undone.")) {
+                    setHistory([]);
+                }
+            };
+
+            // --- UI Helper ---
+            const activeText = selectedText || pageText;
+            const charCount = activeText ? activeText.length : 0;
+
+            const ReaderContent = ({ text, sentences, currentStart }) => {
+                if (sentences.length === 0) {
+                    return <div onMouseUp={handleTextSelection} className="selection-highlight">{text}</div>;
+                }
+
+                let lastIndex = 0;
+                const parts = [];
+
+                sentences.forEach((sentence, i) => {
+                    const sentenceIndex = text.indexOf(sentence.text, lastIndex);
+                    if (sentenceIndex !== -1) {
+                        if (sentenceIndex > lastIndex) {
+                            parts.push(<span key={`pre-${i}`}>{text.substring(lastIndex, sentenceIndex)}</span>);
+                        }
+                        parts.push(
+                            <span key={i} className={sentence.start === currentStart ? 'highlighted-sentence' : ''}>
+                                {sentence.text}
+                            </span>
+                        );
+                        lastIndex = sentenceIndex + sentence.text.length;
+                    } else {
+                        console.warn("Sentence not found in original text:", sentence.text);
+                    }
+                });
+
+                if (lastIndex < text.length) {
+                    parts.push(<span key="post">{text.substring(lastIndex)}</span>);
+                }
+
+                return <>{parts}</>;
+            };
+
+            return (
+                <div className="max-w-6xl mx-auto p-6 relative">
+                    
+                    {/* Header */}
+                    <header className="mb-8 border-b border-slate-700 pb-4 flex justify-between items-end">
+                        <div>
+                            <h1 className="text-3xl font-bold text-cyan-400 neon-text tracking-tight">AudioGen<span className="text-slate-500">.pdf</span></h1>
+                            <p className="text-slate-400 text-sm mt-1">Extract text. Select segment. Generate speech.</p>
+                        </div>
+                        <div className="flex items-center space-x-2">
+                            <a 
+                                href="dashboard.html" 
+                                className="text-slate-400 hover:text-cyan-400 transition-colors p-2 text-xs font-mono uppercase tracking-widest border border-slate-700 rounded hover:border-cyan-500"
+                                title="Go to Dashboard"
+                            >Projects</a>
+                            <a 
+                                href="pdf_editor.html" 
+                                className="text-slate-400 hover:text-cyan-400 transition-colors p-2"
+                                title="Go to Editor"
+                            ><svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg></a>
+                            <button 
+                                onClick={() => { setShowHistory(!showHistory); setShowSettings(false); }}
+                                className={`text-slate-400 hover:text-cyan-400 transition-colors p-2 ${showHistory ? 'text-cyan-400' : ''}`}
+                                title="History"
+                            >
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                            </button>
+                            <button 
+                                onClick={() => { setShowSettings(!showSettings); setShowHistory(false); }}
+                                className={`text-slate-400 hover:text-cyan-400 transition-colors p-2 ${showSettings ? 'text-cyan-400' : ''}`}
+                                title="Settings"
+                            >
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                            </button>
+                        </div>
+                    </header>
+
+                    {/* Settings Drawer */}
+                    {showSettings && (
+                        <div className="absolute top-20 right-6 z-50 w-80 studio-panel rounded-xl p-6 animate-fade-in border-l-4 border-cyan-500">
+                            <h3 className="font-bold text-slate-200 mb-4">API Configuration</h3>
+                            <div className="space-y-4">
+                                <div>
+                                    <label className="block text-xs text-slate-400 mb-1">ElevenLabs API Key</label>
+                                    <input 
+                                        type="password" 
+                                        value={apiKey}
+                                        onChange={(e) => setApiKey(e.target.value)}
+                                        className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm text-slate-200 focus:border-cyan-500 outline-none"
+                                        placeholder="sk_..."
+                                    />
+                                </div>
+                                <button 
+                                    onClick={handleSettingsClose}
+                                    className="w-full bg-slate-700 hover:bg-slate-600 text-slate-200 py-2 rounded text-sm transition-colors"
+                                >
+                                    Save & Close
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* History Sidebar */}
+                    {showHistory && (
+                        <div className="absolute top-20 right-6 z-50 w-80 studio-panel rounded-xl p-6 animate-fade-in border-l-4 border-purple-500 max-h-[80vh] overflow-y-auto shadow-2xl">
+                            <div className="flex justify-between items-center mb-4">
+                                <h3 className="font-bold text-slate-200">Session History</h3>
+                                <button onClick={() => setShowHistory(false)} className="text-slate-500 hover:text-white">
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" /></svg>
+                                </button>
+                            </div>
+                            <div className="space-y-4">
+                                {history.length === 0 && <p className="text-sm text-slate-500 italic text-center py-4">No audio generated yet.</p>}
+                                {history.map(item => (
+                                    <div key={item.id} className="bg-slate-900/50 p-3 rounded border border-slate-700 hover:border-purple-500/50 transition-colors">
+                                        <div className="flex justify-between items-start mb-2">
+                                            <span className="text-xs font-bold text-purple-400 truncate max-w-[120px]">{item.voiceName}</span>
+                                            <span className="text-[10px] text-slate-500">{item.timestamp}</span>
+                                        </div>
+                                        <p className="text-xs text-slate-400 mb-2 line-clamp-2" title={item.text}>"{item.text}"</p>
+                                        <audio controls src={item.url} className="w-full h-6 mb-2" />
+                                        <a href={item.url} download={`speech-${item.id}.mp3`} className="text-[10px] text-cyan-500 hover:underline block text-right">Download MP3</a>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Main Layout */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                        
+                        {/* Left Column: Reader */}
+                        <div className="md:col-span-2 space-y-4">
+                            {!pdfDoc && !pageText ? (
+                                <div className="studio-panel rounded-xl p-12 text-center border-dashed border-2 border-slate-600 hover:border-cyan-500 transition-colors cursor-pointer relative h-96 flex flex-col items-center justify-center">
+                                    <input 
+                                        type="file" 
+                                        accept="application/pdf,.txt" 
+                                        onChange={handleFileUpload}
+                                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                                    />
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16 text-slate-500 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                                    <p className="text-xl font-medium text-slate-200">Upload PDF or Text Document</p>
+                                    <p className="text-sm text-slate-400 mt-2">Click or drag PDF/TXT file here</p>
+                                </div>
+                            ) : (
+                                <div className="studio-panel rounded-xl flex flex-col h-[700px]">
+                                    {/* PDF Controls */}
+                                    <div className="p-4 border-b border-slate-700 flex justify-between items-center bg-slate-800/50 rounded-t-xl">
+                                        <span className="text-sm font-mono text-slate-400 truncate max-w-[150px] md:max-w-[200px]">{fileName}</span>
+                                        <div className="flex items-center space-x-4">
+                                            <button onClick={() => changePage(-1)} disabled={currentPage <= 1 || isEditingText} className="text-slate-400 hover:text-cyan-400 disabled:opacity-30"><svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z" clipRule="evenodd" /></svg></button>
+                                            <span className="text-sm text-slate-200 font-mono">Page {currentPage} / {totalPages}</span>
+                                            <button onClick={() => changePage(1)} disabled={currentPage >= totalPages || isEditingText} className="text-slate-400 hover:text-cyan-400 disabled:opacity-30"><svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clipRule="evenodd" /></svg></button>
+                                        </div>
+                                        <div className="flex items-center space-x-2">
+                                            {!isEditingText ? (
+                                                <>
+                                                    <button onClick={handleCopyText} className="text-xs bg-slate-700 hover:bg-slate-600 text-cyan-400 px-3 py-1 rounded transition-colors" title="Copy page text">
+                                                        Copy Text
+                                                    </button>
+                                                    <button onClick={handleEnterEditMode} className="text-xs bg-slate-700 hover:bg-slate-600 text-cyan-400 px-3 py-1 rounded transition-colors">
+                                                        Edit Text
+                                                    </button>
+                                                </>
+                                            ) : (
+                                                <div className="w-[162px]"></div> // Placeholder for layout consistency
+                                            )}
+                                        </div>
+                                    </div>
+                                    
+                                    {isEditingText ? (
+                                        <>
+                                            <textarea
+                                                className="flex-1 p-8 bg-slate-900 font-serif text-lg leading-relaxed text-slate-200 w-full resize-none focus:outline-none selection-highlight"
+                                                value={editableText}
+                                                onChange={(e) => setEditableText(e.target.value)}
+                                            />
+                                            <div className="p-2 flex justify-end space-x-2 bg-slate-900 rounded-b-xl border-t border-slate-800">
+                                                <button onClick={handleCancelEdit} className="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-3 py-1 rounded">Cancel</button>
+                                                <button onClick={handleSaveChanges} className="text-xs bg-cyan-600 hover:bg-cyan-500 text-white font-bold px-3 py-1 rounded">Save Changes</button>
+                                            </div>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <div className="flex-1 p-8 overflow-y-auto font-serif text-lg leading-relaxed text-slate-300 whitespace-pre-wrap">
+                                                <ReaderContent text={pageText} sentences={sentenceBoundaries} currentStart={currentSentenceStart} />
+                                            </div>
+                                            <div className="p-2 text-center text-xs text-slate-600 bg-slate-900 rounded-b-xl border-t border-slate-800">
+                                                Highlight text to select a specific segment or click 'Edit Text'
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Right Column: Audio Tools */}
+                        <div className="space-y-6">
+                            
+                            {/* Generator Panel */}
+                            <div className="studio-panel rounded-xl p-6">
+                                <h2 className="text-lg font-semibold text-cyan-400 mb-4">Generator</h2>
+                                
+                                {/* Status Messages */}
+                                {errorMsg && <div className="mb-4 p-3 bg-red-900/20 border border-red-900/50 rounded text-red-400 text-xs">{errorMsg}</div>}
+
+                                <div className="space-y-4">
+                                    {/* Voice Selector */}
+                                    <div>
+                                        <div className="flex justify-between items-center mb-1">
+                                            <label className="text-xs text-slate-400">Speaker Voice</label>
+                                            <button onClick={fetchVoices} className="text-[10px] text-cyan-500 hover:underline">Fetch Voices</button>
+                                        </div>
+                                        <select 
+                                            value={selectedVoice} 
+                                            onChange={(e) => setSelectedVoice(e.target.value)}
+                                            className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm text-slate-300 focus:border-cyan-500 outline-none"
+                                        >
+                                            {voices.length === 0 && <option value="">No voices loaded</option>}
+                                            {voices.map(v => (
+                                                <option key={v.voice_id} value={v.voice_id}>{v.name}</option>
+                                            ))}
+                                        </select>
+                                    </div>
+
+                                    {/* Model Selector */}
+                                    <div>
+                                        <label className="text-xs text-slate-400">Speech Model</label>
+                                        <select 
+                                            value={selectedModel} 
+                                            onChange={(e) => setSelectedModel(e.target.value)}
+                                            className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm text-slate-300 focus:border-cyan-500 outline-none mt-1"
+                                            disabled={models.length === 0}
+                                        >
+                                            {models.length === 0 && <option value={selectedModel}>Default Model</option>}
+                                            {models.map(m => (
+                                                <option key={m.model_id} value={m.model_id}>{m.name}</option>
+                                            ))}
+                                        </select>
+                                    </div>
+
+                                    {/* Stats */}
+                                    <div className="bg-slate-900 p-3 rounded border border-slate-700">
+                                        <div className="flex justify-between text-xs mb-1">
+                                            <span className="text-slate-400">Target</span>
+                                            <span className="text-cyan-400">{selectedText ? "Selection" : "Full Page"}</span>
+                                        </div>
+                                        <div className="flex justify-between text-xs">
+                                            <span className="text-slate-400">Characters</span>
+                                            <span className="text-slate-200 font-mono">{charCount}</span>
+                                        </div>
+                                    </div>
+
+                                    {/* Action Button */}
+                                    <button 
+                                        onClick={streamAndPlayAudio}
+                                        disabled={isProcessing || !activeText}
+                                        className={`w-full py-3 rounded-lg font-bold shadow-lg transition-all ${
+                                            isProcessing 
+                                            ? 'bg-slate-700 text-slate-500 cursor-not-allowed' 
+                                            : 'bg-cyan-500 hover:bg-cyan-400 text-slate-900 shadow-cyan-500/20 active:scale-95'
+                                        }`}
+                                    >
+                                        {isProcessing ? (
+                                            <div className="flex items-center justify-center space-x-2">
+                                                <svg className="animate-spin h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                                </svg>
+                                                <span>Processing...</span>
+                                            </div>
+                                        ) : "Generate Audio"}
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Player Panel */}
+                            {audioUrl && (
+                                <div className="studio-panel rounded-xl p-6 animate-fade-in border-t-2 border-cyan-500">
+                                    <h2 className="text-sm font-semibold text-slate-300 mb-3">Playback Result</h2>
+                                    <audio 
+                                        ref={audioPlayerRef} 
+                                        controls 
+                                        src={audioUrl} 
+                                        onTimeUpdate={handleTimeUpdate}
+                                        className="w-full mb-4 h-8" />
+                                    <div className="flex space-x-3">
+                                        <a 
+                                            href={audioUrl} 
+                                            download={`segment-${Date.now()}.mp3`}
+                                            className="flex-1 block text-center py-2 border border-slate-600 rounded text-sm text-slate-300 hover:bg-slate-800 transition-colors"
+                                        >
+                                            Download .mp3
+                                        </a>
+                                        <button 
+                                            onClick={handleSendToNoteTaker}
+                                            className="flex-1 bg-slate-700 hover:bg-cyan-900/40 text-cyan-400 border border-slate-600 hover:border-cyan-500/50 rounded text-sm font-medium transition-all"
+                                        >
+                                            Send to Studio
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Selected Text Preview (if needed) */}
+                            {selectedText && (
+                                <div className="p-4 bg-slate-800/50 rounded-xl border border-dashed border-slate-700">
+                                    <span className="text-[10px] uppercase tracking-wider text-cyan-500 font-bold block mb-2">Selection Preview</span>
+                                    <p className="text-xs text-slate-400 italic line-clamp-4">"{selectedText}"</p>
+                                    <button onClick={() => setSelectedText("")} className="mt-2 text-[10px] text-red-400 hover:underline">Clear Selection</button>
+                                </div>
+                            )}
+
+                        </div>
+                    </div>
+
+                    {/* Global Toast Notification */}
+                    {successMsg && (
+                        <div className="fixed bottom-8 right-8 z-[100] bg-green-500 text-slate-900 px-6 py-4 rounded-xl shadow-2xl animate-fade-in flex items-center font-bold border-2 border-green-400">
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 mr-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                            {successMsg}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<PdfToSpeech />);
+    </script>
+</body>
+</html>

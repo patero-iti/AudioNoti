@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Studio PDF Editor</title>
+    <!-- Allow unsafe-eval for Babel standalone -->
+    <meta http-equiv="Content-Security-Policy" content="script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://cdn.tailwindcss.com https://cdnjs.cloudflare.com; worker-src 'self' blob: https://cdnjs.cloudflare.com;">
+    
+    <!-- Dependencies -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- PDF.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <!-- jsPDF -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+    <!-- Custom Styles -->
+    <style>
+        body {
+            background-color: #0f172a; /* Slate 900 */
+            color: #e2e8f0; /* Slate 200 */
+        }
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #1e293b;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #475569;
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #64748b;
+        }
+        .studio-panel {
+            background-color: #1e293b; /* Slate 800 */
+            border: 1px solid #334155; /* Slate 700 */
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5);
+        }
+        .neon-text {
+            text-shadow: 0 0 10px rgba(34, 211, 238, 0.5);
+        }
+        textarea:focus {
+            outline: none;
+            border-color: #22d3ee;
+            box-shadow: 0 0 0 1px #22d3ee;
+        }
+        .highlight-mark {
+            background-color: rgba(234, 179, 8, 0.5); /* yellow-500/50 - Increased visibility */
+            border-radius: 2px;
+            color: #f8fafc; /* Slate 50 - Ensure text is visible */
+        }
+        /* Make placeholder visible even when text is transparent */
+        textarea::placeholder {
+            color: #475569; /* slate-600 */
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // Initialize PDF.js worker
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        const PdfEditor = () => {
+            // --- State ---
+            const [text, setText] = useState(() => localStorage.getItem('studio_editor_text') || "");
+            const [fileName, setFileName] = useState(() => localStorage.getItem('studio_editor_filename') || "untitled.txt");
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [statusMsg, setStatusMsg] = useState("");
+            const [showFindReplace, setShowFindReplace] = useState(false);
+            const [findQuery, setFindQuery] = useState("");
+            const [replaceQuery, setReplaceQuery] = useState("");
+            const [isCaseSensitive, setIsCaseSensitive] = useState(false);
+            const [showReplaceConfirm, setShowReplaceConfirm] = useState(false);
+            const [replaceCount, setReplaceCount] = useState(0);
+            const [history, setHistory] = useState([text]);
+            const [historyIndex, setHistoryIndex] = useState(0);
+
+            // --- Refs ---
+            const backdropRef = useRef(null);
+            const textareaRef = useRef(null);
+            const historyTimeoutRef = useRef(null);
+
+            // --- Persistence ---
+            useEffect(() => {
+                // Cleanup timeout on unmount
+                return () => {
+                    if (historyTimeoutRef.current) {
+                        clearTimeout(historyTimeoutRef.current);
+                    }
+                };
+            }, []);
+
+            useEffect(() => {
+                localStorage.setItem('studio_editor_text', text);
+                localStorage.setItem('studio_editor_filename', fileName);
+                localStorage.setItem('studio_editor_last_modified', new Date().toISOString());
+            }, [text, fileName]);
+
+            // --- Handlers ---
+            const handleFileUpload = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                setIsProcessing(true);
+                setStatusMsg("Reading PDF...");
+                setFileName(file.name.replace('.pdf', '.txt'));
+
+                try {
+                    const arrayBuffer = await file.arrayBuffer();
+                    const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+                    const doc = await loadingTask.promise;
+                    
+                    let fullText = "";
+                    for (let i = 1; i <= doc.numPages; i++) {
+                        setStatusMsg(`Extracting page ${i} of ${doc.numPages}...`);
+                        const page = await doc.getPage(i);
+                        const textContent = await page.getTextContent();
+                        const pageText = textContent.items.map(item => item.str).join(' ');
+                        fullText += pageText + "\n\n";
+                    }
+
+                    recordChange(fullText);
+                    setStatusMsg("Import complete!");
+                    setTimeout(() => setStatusMsg(""), 3000);
+                } catch (err) {
+                    console.error(err);
+                    setStatusMsg("Failed to parse PDF.");
+                } finally {
+                    setIsProcessing(false);
+                }
+            };
+
+            const handleSaveFile = (format) => {
+                const blob = new Blob([text], { type: format === 'json' ? 'application/json' : 'text/plain' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                
+                let downloadName = fileName.replace(/\.[^/.]+$/, "");
+                a.download = `${downloadName}.${format}`;
+                
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            };
+
+            const handleSendToAudioGen = () => {
+                if (!text) {
+                    setStatusMsg("No text to send!");
+                    return;
+                }
+                
+                setStatusMsg("Sending to AudioGen...");
+                
+                // 1. Use sessionStorage for robust initial load when the tab is opened.
+                const payload = { type: 'LOAD_TEXT', text: text, fileName: fileName };
+                sessionStorage.setItem('studio_pending_text_load', JSON.stringify(payload));
+                
+                // 2. Open the tab. It will find the data in sessionStorage on load.
+                window.open('pdf_converter.html', 'audiogen_pdf_tab');
+
+                // 3. Also use BroadcastChannel to update an *already open* tab instantly.
+                const bc = new BroadcastChannel('studio_text_bridge');
+                console.log("[Editor] Sending payload via BroadcastChannel for hot-reload:", payload);
+                bc.postMessage(payload);
+                bc.close(); // We only need to send it once.
+
+                setTimeout(() => setStatusMsg("Sent successfully!"), 1000);
+                setTimeout(() => setStatusMsg(""), 3000);
+            };
+
+            const copyToClipboard = () => {
+                navigator.clipboard.writeText(text).then(() => {
+                    setStatusMsg("Copied to clipboard!");
+                    setTimeout(() => setStatusMsg(""), 2000);
+                });
+            };
+
+            const recordChange = (newText) => {
+                if (historyTimeoutRef.current) {
+                    clearTimeout(historyTimeoutRef.current);
+                }
+                if (newText === history[historyIndex]) return;
+
+                const newHistory = history.slice(0, historyIndex + 1);
+                newHistory.push(newText);
+                
+                setHistory(newHistory);
+                setHistoryIndex(newHistory.length - 1);
+                setText(newText);
+            };
+
+            const handleTextareaChange = (e) => {
+                const newText = e.target.value;
+                setText(newText);
+
+                if (historyTimeoutRef.current) {
+                    clearTimeout(historyTimeoutRef.current);
+                }
+
+                historyTimeoutRef.current = setTimeout(() => {
+                    const currentHistory = history.slice(0, historyIndex + 1);
+                    if (newText !== currentHistory[currentHistory.length - 1]) {
+                        const newHistory = [...currentHistory, newText];
+                        setHistory(newHistory);
+                        setHistoryIndex(newHistory.length - 1);
+                    }
+                }, 800);
+            };
+
+            const handleUndo = () => {
+                if (historyIndex > 0) {
+                    const newIndex = historyIndex - 1;
+                    setHistoryIndex(newIndex);
+                    setText(history[newIndex]);
+                }
+            };
+
+            const handleRedo = () => {
+                if (historyIndex < history.length - 1) {
+                    const newIndex = historyIndex + 1;
+                    setHistoryIndex(newIndex);
+                    setText(history[newIndex]);
+                }
+            };
+
+            const handleCleanText = () => {
+                if (!text) return;
+
+                let cleanedText = text;
+
+                // 1. Join words broken by a hyphen at the end of a line
+                cleanedText = cleanedText.replace(/(\w+)-\n(\w+)/g, '$1$2');
+
+                // 2. Replace single newlines (that aren't paragraph breaks) with a space.
+                cleanedText = cleanedText.replace(/\n(?!\n)/g, ' ');
+
+                // 3. Consolidate multiple spaces into a single space
+                cleanedText = cleanedText.replace(/ {2,}/g, ' ');
+                
+                // 4. Trim leading/trailing whitespace from the whole text
+                cleanedText = cleanedText.trim();
+
+                recordChange(cleanedText);
+                setStatusMsg("Text cleaned!");
+                setTimeout(() => setStatusMsg(""), 2000);
+            };
+
+            const handleExportPdf = () => {
+                if (!text) {
+                     setStatusMsg("No text to export!");
+                     return;
+                }
+                
+                setStatusMsg("Generating PDF...");
+                
+                try {
+                    const { jsPDF } = window.jspdf;
+                    const doc = new jsPDF();
+                    
+                    // Split text to fit page width (A4 width is ~210mm, leaving margins)
+                    const splitText = doc.splitTextToSize(text, 180); 
+                    
+                    let y = 15;
+                    const pageHeight = doc.internal.pageSize.height;
+                    const lineHeight = 7;
+                    
+                    splitText.forEach(line => {
+                        if (y > pageHeight - 15) {
+                            doc.addPage();
+                            y = 15;
+                        }
+                        doc.text(line, 15, y);
+                        y += lineHeight;
+                    });
+                    
+                    const pdfName = fileName.replace(/\.txt$/i, '.pdf') || 'document.pdf';
+                    doc.save(pdfName);
+                    setStatusMsg("PDF exported!");
+                } catch (err) {
+                    console.error(err);
+                    setStatusMsg("Failed to export PDF.");
+                } finally {
+                    setTimeout(() => setStatusMsg(""), 2000);
+                }
+            };
+
+            const insertMarkdown = (prefix, suffix = "") => {
+                if (!textareaRef.current) return;
+                
+                const start = textareaRef.current.selectionStart;
+                const end = textareaRef.current.selectionEnd;
+                const selection = text.substring(start, end);
+                
+                const newText = text.substring(0, start) + prefix + selection + suffix + text.substring(end);
+                
+                recordChange(newText);
+                
+                // Restore selection/cursor
+                setTimeout(() => {
+                    textareaRef.current.focus();
+                    const newCursorPos = start + prefix.length;
+                    textareaRef.current.setSelectionRange(newCursorPos, newCursorPos + selection.length);
+                }, 0);
+            };
+
+            const handleReplace = () => {
+                if (!findQuery) return;
+                
+                const escapeRegExp = (string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const flags = isCaseSensitive ? 'g' : 'gi';
+                const regex = new RegExp(escapeRegExp(findQuery), flags);
+                
+                const matches = text.match(regex);
+                const count = matches ? matches.length : 0;
+
+                if (count === 0) {
+                    setStatusMsg("No matches found.");
+                    setTimeout(() => setStatusMsg(""), 2500);
+                    return;
+                }
+
+                setReplaceCount(count);
+                setShowReplaceConfirm(true);
+            };
+
+            const confirmReplace = () => {
+                const escapeRegExp = (string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const flags = isCaseSensitive ? 'g' : 'gi';
+                const regex = new RegExp(escapeRegExp(findQuery), flags);
+                const newText = text.replace(regex, replaceQuery);
+
+                recordChange(newText);
+                setStatusMsg(`Replaced ${replaceCount} instance(s).`);
+                setShowReplaceConfirm(false);
+                setTimeout(() => setStatusMsg(""), 2500);
+            };
+
+            const clearText = () => {
+                if(window.confirm("Clear all text? This cannot be undone.")) {
+                    recordChange("");
+                }
+            };
+
+            const highlightedContent = useMemo(() => {
+                if (!findQuery || !text) {
+                    // Just return plain text, but escaped for safety in HTML.
+                    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                }
+                const escapeRegExp = (string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const flags = isCaseSensitive ? 'g' : 'gi';
+                const regex = new RegExp(`(${escapeRegExp(findQuery)})`, flags);
+                
+                const escapedText = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                
+                // Wrap matches in a mark tag. The text inside is made transparent by CSS.
+                return escapedText.replace(regex, `<mark class="highlight-mark">$1</mark>`);
+            }, [text, findQuery, isCaseSensitive]);
+
+            const textStats = useMemo(() => {
+                const words = text.trim() === "" ? 0 : text.trim().split(/\s+/).length;
+                const minutes = Math.ceil(words / 225); // Average reading speed
+                return { words, minutes };
+            }, [text]);
+
+            return (
+                <div className="max-w-7xl mx-auto p-6 h-screen flex flex-col">
+                    
+                    {/* Header */}
+                    <header className="mb-6 border-b border-slate-700 pb-4 flex justify-between items-end shrink-0">
+                        <div>
+                            <h1 className="text-3xl font-bold text-cyan-400 neon-text tracking-tight">Studio<span className="text-slate-500">.editor</span></h1>
+                            <p className="text-slate-400 text-sm mt-1">PDF Extraction & Text Manipulation</p>
+                        </div>
+                        <div className="flex items-center space-x-2">
+                             <a 
+                                href="dashboard.html" 
+                                className="text-slate-400 hover:text-cyan-400 transition-colors p-2 text-xs font-mono uppercase tracking-widest border border-slate-700 rounded hover:border-cyan-500"
+                                title="Go to Dashboard"
+                            >Projects</a>
+                            <a 
+                                href="pdf_converter.html" 
+                                className="text-slate-400 hover:text-white transition-colors"
+                                title="Go to AudioGen"
+                            >
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
+                            </a>
+                        </div>
+                    </header>
+
+                    {/* Main Workspace */}
+                    <div className="flex-1 grid grid-cols-1 lg:grid-cols-4 gap-6 min-h-0">
+                        
+                        {/* Sidebar Controls */}
+                        <div className="lg:col-span-1 space-y-4">
+                            
+                            {/* Import Panel */}
+                            <div className="studio-panel p-6 rounded-xl">
+                                <h2 className="text-lg font-semibold text-slate-200 mb-4">Import</h2>
+                                <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-slate-600 border-dashed rounded-lg cursor-pointer bg-slate-800 hover:bg-slate-700 hover:border-cyan-500 transition-all group">
+                                    <div className="flex flex-col items-center justify-center pt-5 pb-6">
+                                        <svg className="w-8 h-8 mb-2 text-slate-500 group-hover:text-cyan-400" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 20 16">
+                                            <path stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 13h3a3 3 0 0 0 0-6h-.025A5.56 5.56 0 0 0 16 6.5 5.5 5.5 0 0 0 5.207 5.021C5.137 5.017 5.071 5 5 5a4 4 0 0 0 0 8h2.167M10 15V6m0 0L8 8m2-2 2 2"/>
+                                        </svg>
+                                        <p className="text-xs text-slate-400">Click to upload PDF</p>
+                                    </div>
+                                    <input type="file" className="hidden" accept=".pdf" onChange={handleFileUpload} />
+                                </label>
+                                {statusMsg && <p className="text-xs text-cyan-400 mt-2 text-center animate-pulse">{statusMsg}</p>}
+                            </div>
+
+                            {/* Actions Panel */}
+                            <div className="studio-panel p-6 rounded-xl space-y-3">
+                                <h2 className="text-lg font-semibold text-slate-200 mb-2">Actions</h2>
+                                
+                                <div className="flex space-x-2">
+                                    <button onClick={handleUndo} disabled={historyIndex <= 0} className="flex-1 py-2 px-3 bg-slate-700 hover:bg-slate-600 rounded text-sm text-slate-200 flex items-center justify-center space-x-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 15l-3-3m0 0l3-3m-3 3h8A5 5 0 009 3h-1" /></svg>
+                                        <span>Undo</span>
+                                    </button>
+                                    <button onClick={handleRedo} disabled={historyIndex >= history.length - 1} className="flex-1 py-2 px-3 bg-slate-700 hover:bg-slate-600 rounded text-sm text-slate-200 flex items-center justify-center space-x-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                                        <span>Redo</span>
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 15l3-3m0 0l-3-3m3 3H8A5 5 0 003 9h1" /></svg>
+                                    </button>
+                                </div>
+
+                                <button onClick={copyToClipboard} className="w-full py-2 px-3 bg-slate-700 hover:bg-slate-600 rounded text-sm text-slate-200 flex items-center justify-center space-x-2 transition-colors">
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" /></svg>
+                                    <span>Copy All</span>
+                                </button>
+                                
+                                <button onClick={() => setShowFindReplace(!showFindReplace)} className="w-full py-2 px-3 bg-slate-700 hover:bg-slate-600 rounded text-sm text-slate-200 flex items-center justify-center space-x-2 transition-colors">
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+                                    <span>Find & Replace</span>
+                                </button>
+
+                                <button onClick={handleCleanText} className="w-full py-2 px-3 bg-slate-700 hover:bg-slate-600 rounded text-sm text-slate-200 flex items-center justify-center space-x-2 transition-colors">
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456zM16.898 20.562L16.25 22.5l-.648-1.938a2.25 2.25 0 01-1.476-1.476L12 18.75l1.938-.648a2.25 2.25 0 011.476-1.476L17.25 15l.648 1.938a2.25 2.25 0 011.476 1.476L21 18.75l-1.938.648a2.25 2.25 0 01-1.476 1.476z" /></svg>
+                                    <span>Clean Text</span>
+                                </button>
+
+                                {showFindReplace && (
+                                    <div className="bg-slate-800 p-3 rounded border border-slate-600 space-y-2 animate-fade-in">
+                                        <input 
+                                            type="text" 
+                                            placeholder="Find..." 
+                                            value={findQuery}
+                                            onChange={(e) => setFindQuery(e.target.value)}
+                                            className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 focus:border-cyan-500 outline-none"
+                                        />
+                                        <input 
+                                            type="text" 
+                                            placeholder="Replace with..." 
+                                            value={replaceQuery}
+                                            onChange={(e) => setReplaceQuery(e.target.value)}
+                                            className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 focus:border-cyan-500 outline-none"
+                                        />
+                                        <label className="flex items-center space-x-2 text-xs text-slate-400 cursor-pointer py-1">
+                                            <input 
+                                                type="checkbox" 
+                                                checked={isCaseSensitive} 
+                                                onChange={(e) => setIsCaseSensitive(e.target.checked)}
+                                                className="bg-slate-900 border-slate-600 rounded-sm text-cyan-500 focus:ring-cyan-500 focus:ring-offset-slate-800"
+                                            />
+                                            <span>Case Sensitive</span>
+                                        </label>
+                                        <button onClick={handleReplace} className="w-full bg-cyan-600 hover:bg-cyan-500 text-white text-xs py-1 rounded">Replace All</button>
+                                    </div>
+                                )}
+
+                                <button onClick={clearText} className="w-full py-2 px-3 bg-slate-700 hover:bg-red-900/50 text-red-400 rounded text-sm flex items-center justify-center space-x-2 transition-colors">
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                                    <span>Clear Text</span>
+                                </button>
+
+                                <div className="border-t border-slate-700 my-2 pt-2">
+                                    <p className="text-xs text-slate-500 mb-2">Save Locally</p>
+                                    <div className="grid grid-cols-4 gap-2">
+                                        <button onClick={() => handleSaveFile('txt')} className="bg-slate-800 hover:bg-slate-700 text-cyan-500 py-1 rounded text-xs border border-slate-700">.TXT</button>
+                                        <button onClick={() => handleSaveFile('json')} className="bg-slate-800 hover:bg-slate-700 text-cyan-500 py-1 rounded text-xs border border-slate-700">.JSON</button>
+                                        <button onClick={() => handleSaveFile('csv')} className="bg-slate-800 hover:bg-slate-700 text-cyan-500 py-1 rounded text-xs border border-slate-700">.CSV</button>
+                                        <button onClick={handleExportPdf} className="bg-slate-800 hover:bg-slate-700 text-cyan-500 py-1 rounded text-xs border border-slate-700">.PDF</button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Bridge Panel */}
+                            <div className="studio-panel p-6 rounded-xl border-l-4 border-purple-500">
+                                <h2 className="text-lg font-bold text-slate-100 mb-2">Workflow</h2>
+                                <p className="text-xs text-slate-400 mb-4">Send extracted text directly to AudioGen for speech synthesis.</p>
+                                <button 
+                                    onClick={handleSendToAudioGen}
+                                    className="w-full py-3 bg-purple-600 hover:bg-purple-500 text-white font-bold rounded-lg shadow-lg shadow-purple-900/20 transition-all active:scale-95"
+                                >
+                                    Send to AudioGen.pdf
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Editor Area */}
+                        <div className="lg:col-span-3 studio-panel rounded-xl flex flex-col overflow-hidden h-full">
+                            <div className="p-3 border-b border-slate-700 bg-slate-800/50 flex justify-between items-center">
+                                <input 
+                                    type="text" 
+                                    value={fileName}
+                                    onChange={(e) => setFileName(e.target.value)}
+                                    className="bg-transparent text-slate-300 font-mono text-sm focus:outline-none border-b border-transparent focus:border-cyan-500 px-1"
+                                />
+                                <div className="flex space-x-3 text-xs text-slate-500 font-mono">
+                                    <span>{textStats.words} words</span>
+                                    <span>~{textStats.minutes} min read</span>
+                                    <span>{text.length} chars</span>
+                                </div>
+                            </div>
+                            <div className="px-3 py-2 border-b border-slate-700 bg-slate-800/30 flex space-x-1 overflow-x-auto">
+                                <button onClick={() => insertMarkdown('**', '**')} className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs font-bold text-slate-300 min-w-[24px]" title="Bold">B</button>
+                                <button onClick={() => insertMarkdown('*', '*')} className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs italic text-slate-300 min-w-[24px]" title="Italic">I</button>
+                                <div className="w-px h-6 bg-slate-700 mx-1"></div>
+                                <button onClick={() => insertMarkdown('# ')} className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs font-bold text-slate-300" title="Heading 1">H1</button>
+                                <button onClick={() => insertMarkdown('## ')} className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs font-bold text-slate-300" title="Heading 2">H2</button>
+                                <button onClick={() => insertMarkdown('- ')} className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs font-bold text-slate-300" title="List Item">• List</button>
+                            </div>
+                            <div className="relative flex-1 w-full bg-slate-900 overflow-hidden">
+                                <div 
+                                    ref={backdropRef}
+                                    className="absolute inset-0 w-full h-full p-6 font-serif text-lg leading-relaxed text-slate-300 pointer-events-none overflow-auto whitespace-pre-wrap"
+                                    dangerouslySetInnerHTML={{ __html: highlightedContent }}
+                                />
+                                <textarea 
+                                    ref={textareaRef}
+                                    className="absolute inset-0 w-full h-full p-6 bg-transparent text-transparent caret-white font-serif text-lg leading-relaxed resize-none selection:bg-cyan-500/30 selection:text-cyan-100 focus:outline-none"
+                                    placeholder="Import PDF or start typing..."
+                                    value={text}
+                                    onChange={handleTextareaChange}
+                                    onScroll={(e) => {
+                                        if (backdropRef.current) {
+                                            backdropRef.current.scrollTop = e.target.scrollTop;
+                                            backdropRef.current.scrollLeft = e.target.scrollLeft;
+                                        }
+                                    }}
+                                    spellCheck="false"
+                                ></textarea>
+                            </div>
+                        </div>
+
+                    </div>
+
+                    {/* Confirmation Modal */}
+                    {showReplaceConfirm && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in">
+                            <div className="bg-slate-800 border border-slate-600 p-6 rounded-xl shadow-2xl max-w-md w-full mx-4">
+                                <h3 className="text-xl font-bold text-white mb-2">Confirm Replacement</h3>
+                                <p className="text-slate-300 mb-6">
+                                    Replace <span className="text-cyan-400 font-bold">{replaceCount}</span> occurrence{replaceCount !== 1 ? 's' : ''} of "<span className="text-yellow-400 font-mono">{findQuery}</span>" with "<span className="text-green-400 font-mono">{replaceQuery}</span>"?
+                                </p>
+                                <div className="flex justify-end space-x-3">
+                                    <button 
+                                        onClick={() => setShowReplaceConfirm(false)}
+                                        className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded text-slate-200 transition-colors"
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button 
+                                        onClick={confirmReplace}
+                                        className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white font-bold rounded transition-colors shadow-lg shadow-cyan-500/20"
+                                    >
+                                        Replace All
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<PdfEditor />);
+    </script>
+</body>
+</html>
